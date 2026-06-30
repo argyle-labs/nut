@@ -1,9 +1,0 @@
-services:
-  nut:
-    image: ghcr.io/scottdkey/nut:latest
-    container_name: nut
-    restart: unless-stopped
-    ports:
-      - "3493:3493"
-    volumes:
-      - /opt/nut/config:/config

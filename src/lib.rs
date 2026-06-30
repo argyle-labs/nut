@@ -7,8 +7,8 @@
 #![allow(clippy::disallowed_types)]
 
 use plugin_toolkit::service::{
-    BackupArtifact, BoxFuture, Endpoint, Runtime, ServiceBackend, ServiceCapability, ServiceError,
-    ServiceStatus, WorkloadSpec,
+    BoxFuture, Endpoint, Runtime, ServiceBackend, ServiceCapability, ServiceError, ServiceStatus,
+    WorkloadSpec,
 };
 
 mod abi_export;
@@ -38,6 +38,12 @@ impl ServiceBackend for NutBackend {
 
     fn default_port(&self) -> u16 { 3493 }
 
+    /// In-workload paths holding config/data. This is ALL nut declares for
+    /// backup — the generic pluggable backup (tar for containers/LXC, PBS for
+    /// Proxmox guests when available) snapshots these. No backup/restore code
+    /// here; those are inherited from ServiceBackend's defaults.
+    fn data_paths(&self) -> Vec<String> { vec!["/config".to_string()] }
+
     fn workload_spec<'a>(&'a self, _runtime: Runtime, _ep: &'a Endpoint)
         -> BoxFuture<'a, Result<WorkloadSpec, ServiceError>>
     {
@@ -45,19 +51,6 @@ impl ServiceBackend for NutBackend {
         // env) for the chosen runtime. The deploy target turns this into a
         // compose service / LXC config / VM. See deploy-target::WorkloadSpec.
         Box::pin(async move { Err(ServiceError::unimplemented("nut.workload_spec")) })
-    }
-
-    fn backup<'a>(&'a self, _ep: &'a Endpoint)
-        -> BoxFuture<'a, Result<BackupArtifact, ServiceError>>
-    {
-        // TODO: snapshot config/data (exclude regenerable cache).
-        Box::pin(async move { Err(ServiceError::unimplemented("nut.backup")) })
-    }
-
-    fn restore<'a>(&'a self, _ep: &'a Endpoint, _from: &'a BackupArtifact)
-        -> BoxFuture<'a, Result<(), ServiceError>>
-    {
-        Box::pin(async move { Err(ServiceError::unimplemented("nut.restore")) })
     }
 
     fn configure<'a>(&'a self, _ep: &'a Endpoint, _config: &'a str)

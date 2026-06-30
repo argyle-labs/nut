@@ -1,21 +1,15 @@
 # nut — ServiceBackend contract checklist
 
-Driven by the generic `service.*` surface (no per-plugin tools). `[ ]` =
-scaffolded stub. Modalities: **host,docker,lxc**.
+Pure-Rust plugin: **no bash, no compose, no provision scripts**. Driven by the
+generic `service.*` surface (no per-plugin tools). Modalities: **host,docker,lxc**.
 
-## ServiceBackend methods
-- [ ] `provider` / `modalities` / `default_port` (declared)
-- [ ] `deploy(modality)` — docker/podman/lxc/vm as applicable
-- [ ] `backup`
-- [ ] `restore`
-- [ ] `configure` — service-specific config
+## What this plugin implements (the only per-plugin work)
+- [ ] `provider` / `runtimes` / `default_port` / `capabilities` / `data_paths` — declarative
+- [ ] `workload_spec(runtime)` — *what* to run; `deploy_target` renders it to compose/LXC/VM
+- [ ] `configure` — service-specific config via the upstream API
 - [ ] `status` — health/diagnostics
-- [ ] connect/sync handled generically by the toolkit (endpoint registry + peer sync)
 
-## Deploy modalities
-- [ ] docker compose
-- n/a podman
-- [ ] LXC (pct)
-- n/a vm
-- n/a device
-- [ ] host service (systemd)
+## Inherited generically (NO code in this plugin)
+- `deploy` — `service.deploy` → `deploy_target.launch(WorkloadSpec)`
+- `backup` / `restore` — pluggable `BackupMethod` (tar for containers/LXC, **PBS** for Proxmox guests when available)
+- `connect` / `sync` — endpoint registry + peer sync in the toolkit
