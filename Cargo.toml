@@ -2,6 +2,10 @@
 name = "nut"
 version = "0.1.0"
 edition = "2021"
+description = "Network UPS Tools — orca service-backend"
+
+[package.metadata.orca]
+category = "monitoring"
 
 [lib]
 name = "nut"
