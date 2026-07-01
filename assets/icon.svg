@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <clipPath id="tile"><rect x="16" y="16" width="480" height="480" rx="108"/></clipPath>
+    <pattern id="argyle" width="120" height="160" patternUnits="userSpaceOnUse">
+      <rect width="120" height="160" fill="#061208"/>
+      <polygon points="60,0 120,80 60,160 0,80" fill="#153E1B"/>
+      <polygon points="0,0 60,80 0,160" fill="#0D2610"/>
+      <polygon points="120,0 60,80 120,160" fill="#0D2610"/>
+      <g stroke="#3FB950" stroke-width="2" opacity="0.30" stroke-dasharray="6 7">
+        <path d="M60 -80 L200 80 M60 -80 L-80 80 M60 80 L200 240 M60 80 L-80 240 M60 240 L200 400 M60 240 L-80 400"/>
+      </g>
+    </pattern>
+  </defs>
+  <g clip-path="url(#tile)"><rect x="16" y="16" width="480" height="480" fill="url(#argyle)"/></g>
+  <rect x="16" y="16" width="480" height="480" rx="108" fill="none" stroke="#2BD3D3" stroke-width="6"/>
+  <g fill="#3FB950"><rect x="168" y="188" width="176" height="150" rx="16"/><rect x="224" y="168" width="64" height="24" rx="8"/><path d="M262 214 l-34 60 h28 l-12 44 46 -66 h-28 z" fill="#0b0b0b" opacity="0.65"/></g>
+</svg>
