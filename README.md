@@ -14,9 +14,13 @@ This repo is **self-contained** — the steps below run nut **by hand, without o
 
 ## Run it without orca
 
-### Docker / Podman
+### Docker Compose
 
-The right image depends on your host/hardware — see the upstream install docs: <https://networkupstools.org/>. Expose port `3493` and persist the config volume.
+The right image depends on your host/hardware — see the upstream install docs: <https://networkupstools.org/>. Expose port `3493` and persist the config volume. The same install works under docker, podman, an LXC, a VM, or Unraid.
+
+### Dependencies
+
+Requires a UPS connected to the host over USB or serial.
 
 ### Ports & data
 
