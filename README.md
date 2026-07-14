@@ -47,8 +47,26 @@ orca service.backup nut      # location-agnostic backup (tar; PBS on Proxmox)
 orca service.configure nut   # apply config via the upstream API
 ```
 
+## Diagnostics & repair
+
+nut also contributes a `diagnostics` provider, surfaced through orca's generic
+`diagnostics.*` tools, that detects and repairs the UPS-side conditions behind a
+hung power-loss shutdown — and installs a survivable event-logging path (flash +
+remote) plus an on-battery diagnostics snapshot taken before shutdown proceeds:
+
+```sh
+orca diagnostics diagnose --provider nut   # ups-comms, kill-power, battery-thresholds, …
+orca diagnostics repair --provider nut --repair-id kill-power   # confirm-gated, privileged
+```
+
+The `shutdown-command` repair delegates to the sibling `unraid` plugin's
+`shutdown-timeout` remediation (the force-unmount-aware fix lives on the host
+side). See [CAPABILITIES.md](CAPABILITIES.md) for the full check/repair table.
+
 ## Layout
 
-- `src/` — the plugin (pure Rust): the `ServiceBackend` descriptor + `configure` / `status`.
+- `src/` — the plugin (pure Rust): the `ServiceBackend` (`workload_spec` /
+  `configure` / `status`), the `upsd` TCP client, config renderers, and the
+  `diagnostics` checks/repairs.
 - [CAPABILITIES.md](CAPABILITIES.md) — the service-backend contract checklist.
 - `assets/` — plugin icon.

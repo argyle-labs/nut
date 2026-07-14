@@ -21,6 +21,11 @@ path = "src/main.rs"
 # through plugin-toolkit alone.
 [dependencies]
 plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
+# NUT's upsd is a line-based ASCII TCP protocol on 3493; the client speaks it
+# directly over tokio TCP. The toolkit hard-links tokio but not its `net`
+# feature, so nut enables `net` here (plus the io/time it uses for the client).
+tokio = { version = "1", features = ["net", "io-util", "time", "rt"] }
+serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
