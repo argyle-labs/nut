@@ -34,7 +34,7 @@ fn to_state(u: &Ups) -> UpsState {
         },
         model: (!u.description.is_empty()).then(|| u.description.clone()),
         battery_charge: u.battery_charge(),
-        battery_runtime_secs: u.battery_runtime().map(|s| s as i64),
+        battery_runtime_ms: u.battery_runtime().map(|s| (s * 1000.0) as i64),
         input_voltage: u.input_voltage(),
         load_percent: u.vars.get("ups.load").and_then(|v| v.parse().ok()),
         on_battery: u.on_battery(),
