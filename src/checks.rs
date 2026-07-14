@@ -505,7 +505,7 @@ fn merged_safe_config(dir: &Path) -> NutConfig {
 
 /// Parse `upsmon.conf` into the fields the checks read. Returns `None` when the
 /// file is absent (NUT not set up as a monitor here).
-fn read_upsmon(dir: &Path) -> Option<UpsmonSettings> {
+pub(crate) fn read_upsmon(dir: &Path) -> Option<UpsmonSettings> {
     let text = fs::read_to_string(dir.join("upsmon.conf")).ok()?;
     let mut s = UpsmonSettings::default();
     let mut saw_flag = false;

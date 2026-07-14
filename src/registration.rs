@@ -11,6 +11,8 @@ use plugin_toolkit::serde_json;
 
 /// Invoke prefix the diagnostics proxy calls back through.
 pub const DIAG_PREFIX: &str = "nut.__diag";
+/// Invoke prefix the core `ups` capability proxy calls back through.
+pub const UPS_PREFIX: &str = "nut.__ups";
 
 /// The `diagnostics` backend descriptor this plugin advertises.
 pub fn diagnostics_backend_def() -> BackendDef {
@@ -20,6 +22,28 @@ pub fn diagnostics_backend_def() -> BackendDef {
         invoke_prefix: DIAG_PREFIX.to_string(),
         ..Default::default()
     }
+}
+
+/// The `ups` backend descriptor — nut as one provider of the core UPS capability.
+pub fn ups_backend_def() -> BackendDef {
+    BackendDef {
+        domain: "ups".to_string(),
+        name: crate::PROVIDER.to_string(),
+        invoke_prefix: UPS_PREFIX.to_string(),
+        ..Default::default()
+    }
+}
+
+/// Answer `nut.__ups.{state,config_get,config_set}` calls the loader's UPS proxy
+/// makes. `None` for any name outside the ups prefix.
+pub fn ups_dispatch(name: &str, args_json: &str) -> Option<Result<String, String>> {
+    let op = name.strip_prefix(UPS_PREFIX)?.strip_prefix('.')?;
+    Some(match op {
+        "state" => crate::ups::state(args_json),
+        "config_get" => crate::ups::config_get(args_json),
+        "config_set" => crate::ups::config_set(args_json),
+        other => Err(format!("nut: unknown ups op '{other}'")),
+    })
 }
 
 /// Answer `nut.__diag.{diagnose,repair}` calls the loader's proxy makes. Returns
@@ -40,6 +64,7 @@ pub fn diag_dispatch(name: &str, args_json: &str) -> Option<Result<String, Strin
 pub fn merged_backends_json(service_json: &str) -> String {
     let mut defs: Vec<BackendDef> = serde_json::from_str(service_json).unwrap_or_default();
     defs.push(diagnostics_backend_def());
+    defs.push(ups_backend_def());
     serde_json::to_string(&defs).unwrap_or_else(|_| service_json.to_string())
 }
 
@@ -65,5 +90,17 @@ mod tests {
         let merged = merged_backends_json(service);
         assert!(merged.contains("\"domain\":\"service\""));
         assert!(merged.contains("\"domain\":\"diagnostics\""));
+        assert!(merged.contains("\"domain\":\"ups\""));
+    }
+
+    #[test]
+    fn ups_dispatch_answers_config_get() {
+        let out = ups_dispatch("nut.__ups.config_get", "{}").expect("owned");
+        assert!(out.is_ok());
+    }
+
+    #[test]
+    fn ups_dispatch_ignores_foreign_names() {
+        assert!(ups_dispatch("nut.__diag.diagnose", "{}").is_none());
     }
 }

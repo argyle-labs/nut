@@ -13,15 +13,20 @@ use plugin_toolkit::reactor;
 use plugin_toolkit::serve::{serve, PluginSpec};
 use plugin_toolkit::service::dispatch_op;
 
-use nut::registration::{diag_dispatch, merged_backends_json, DIAG_PREFIX};
+use nut::registration::{
+    diag_dispatch, merged_backends_json, ups_dispatch, DIAG_PREFIX, UPS_PREFIX,
+};
 use nut::NutBackend;
 
 const SERVICE_PREFIX: &str = "service.__backend.nut";
 
-/// Combined hybrid dispatch: diagnostics first, then the service backend.
+/// Combined hybrid dispatch: diagnostics + ups first, then the service backend.
 fn dispatch(tool: &str, args_json: &str) -> Option<Result<String, String>> {
     if tool.starts_with(DIAG_PREFIX) {
         return diag_dispatch(tool, args_json);
+    }
+    if tool.starts_with(UPS_PREFIX) {
+        return ups_dispatch(tool, args_json);
     }
     let op = tool
         .strip_prefix(SERVICE_PREFIX)

@@ -19,6 +19,7 @@ pub mod checks;
 pub mod client;
 pub mod config;
 pub mod registration;
+pub mod ups;
 
 use crate::client::{NutClient, DEFAULT_PORT};
 use crate::config::{detect_conf_dir, NutConfig};
