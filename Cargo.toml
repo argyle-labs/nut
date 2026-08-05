@@ -20,7 +20,7 @@ path = "src/main.rs"
 # ServiceBackend over the orca socket and reaches the whole orca system
 # through plugin-toolkit alone.
 [dependencies]
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", tag = "v0.1.7-rc.1" }
 # NUT's upsd is a line-based ASCII TCP protocol on 3493; the client speaks it
 # directly over tokio TCP. The toolkit hard-links tokio but not its `net`
 # feature, so nut enables `net` here (plus the io/time it uses for the client).
@@ -28,7 +28,7 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt"] }
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", tag = "v0.1.7-rc.1" }
 tokio    = { version = "1", features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
 
