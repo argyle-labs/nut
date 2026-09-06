@@ -18,8 +18,6 @@ use std::path::{Path, PathBuf};
 use plugin_toolkit::contract::diagnostics::{
     DiagnoseArgs, Finding, RepairArgs, RepairOutcome, RepairSpec, Severity,
 };
-use plugin_toolkit::reactor;
-use plugin_toolkit::serde_json;
 
 use crate::client::{NutClient, Ups, DEFAULT_PORT};
 use crate::config::{detect_conf_dir, NotifySettings, NutConfig, UpsmonSettings};
@@ -34,29 +32,47 @@ fn shutdown_cmd_unsafe(cmd: &str) -> bool {
 
 // ── diagnose ─────────────────────────────────────────────────────────────────
 
-/// Run every check and return the findings as JSON (`Vec<Finding>`).
-pub fn diagnose(args_json: &str) -> Result<String, String> {
-    let _: DiagnoseArgs = if args_json.trim().is_empty() {
-        DiagnoseArgs::default()
-    } else {
-        serde_json::from_str(args_json).unwrap_or_default()
-    };
+/// Run every check and return the typed findings. Network probes are awaited
+/// directly on the shared reactor (the provider future already runs under it),
+/// so nothing here re-enters `block_on`.
+pub async fn diagnose_typed(_args: DiagnoseArgs) -> Vec<Finding> {
     let dir = detect_conf_dir();
     let upsmon = read_upsmon(&dir);
     let upssched = fs::read_to_string(dir.join("upssched.conf")).unwrap_or_default();
-    let findings: Vec<Finding> = [
-        check_apcupsd_active(),
-        check_ups_comms(&dir),
-        check_battery_thresholds(&upsmon),
-        check_kill_power(&upsmon),
-        check_shutdown_command(&upsmon),
-        check_persistent_event_log(&upsmon, &upssched),
-        check_onbattery_capture(&upssched),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    serde_json::to_string(&findings).map_err(|e| format!("encode findings: {e}"))
+    let ups_conf = fs::read_to_string(dir.join("ups.conf")).unwrap_or_default();
+    // A `ups-comms` finding is only meaningful when this host is a NUT server
+    // (has ups.conf sections) or runs apcupsd (migration candidate).
+    let needs_comms = !ups_conf.trim().is_empty() || apcupsd_present();
+    // Probe upsd once and share the result across the comms + battery checks.
+    let probe: Option<Result<Vec<Ups>, String>> = if needs_comms || upsmon.is_some() {
+        Some(probe_upses().await)
+    } else {
+        None
+    };
+    let live_runtime = probe
+        .as_ref()
+        .and_then(|r| r.as_ref().ok())
+        .and_then(|upses| upses.iter().find_map(|u| u.battery_runtime()));
+
+    let mut findings: Vec<Finding> = Vec::new();
+    findings.extend(check_apcupsd_active());
+    if needs_comms {
+        // `probe` is `Some` whenever `needs_comms` is true.
+        findings.push(check_ups_comms(probe.as_ref().expect("probed when needed")));
+    }
+    findings.extend(check_battery_thresholds(&upsmon, live_runtime));
+    findings.extend(check_kill_power(&upsmon));
+    findings.extend(check_shutdown_command(&upsmon));
+    findings.extend(check_persistent_event_log(&upsmon, &upssched));
+    findings.extend(check_onbattery_capture(&upssched));
+    findings
+}
+
+/// Best-effort probe of the UPSes `upsd` exposes on this host.
+async fn probe_upses() -> Result<Vec<Ups>, String> {
+    let host = upsd_host();
+    let mut c = NutClient::connect(&host, DEFAULT_PORT).await?;
+    c.list_upses().await
 }
 
 fn finding(
@@ -110,21 +126,12 @@ fn check_apcupsd_active() -> Option<Finding> {
     ))
 }
 
-/// `ups-comms`: `upsd` unreachable or a UPS not reporting → Crit.
-fn check_ups_comms(dir: &Path) -> Option<Finding> {
-    // Only meaningful when this host is a NUT server (has ups.conf sections) or
-    // is configured to monitor one. If neither apcupsd nor NUT is set up, skip.
-    let ups_conf = fs::read_to_string(dir.join("ups.conf")).unwrap_or_default();
-    if ups_conf.trim().is_empty() && !apcupsd_present() {
-        return None;
-    }
-    let host = upsd_host();
-    let result = reactor::block_on(async move {
-        let mut c = NutClient::connect(&host, DEFAULT_PORT).await?;
-        c.list_upses().await
-    });
-    match result {
-        Err(e) => Some(finding(
+/// `ups-comms`: `upsd` unreachable or a UPS not reporting → Crit. `probe` is the
+/// shared upsd read from [`diagnose_typed`]; the caller only invokes this when a
+/// comms check is meaningful (NUT server or apcupsd present).
+fn check_ups_comms(probe: &Result<Vec<Ups>, String>) -> Finding {
+    match probe {
+        Err(e) => finding(
             "ups-comms",
             Severity::Crit,
             "upsd unreachable — UPS state is invisible",
@@ -133,8 +140,8 @@ fn check_ups_comms(dir: &Path) -> Option<Finding> {
                 "ups-comms",
                 "Restart/redeploy the NUT server so upsd serves UPS state (privileged)",
             )),
-        )),
-        Ok(upses) if upses.is_empty() => Some(finding(
+        ),
+        Ok(upses) if upses.is_empty() => finding(
             "ups-comms",
             Severity::Crit,
             "upsd reports no UPS",
@@ -144,7 +151,7 @@ fn check_ups_comms(dir: &Path) -> Option<Finding> {
                 "ups-comms",
                 "Restart the NUT driver/server so the UPS reports (privileged)",
             )),
-        )),
+        ),
         Ok(upses) => {
             let stale: Vec<&str> = upses
                 .iter()
@@ -152,15 +159,15 @@ fn check_ups_comms(dir: &Path) -> Option<Finding> {
                 .map(|u| u.name.as_str())
                 .collect();
             if stale.is_empty() {
-                Some(finding(
+                finding(
                     "ups-comms",
                     Severity::Ok,
                     "UPS reporting normally",
-                    ups_comms_summary(&upses),
+                    ups_comms_summary(upses),
                     None,
-                ))
+                )
             } else {
-                Some(finding(
+                finding(
                     "ups-comms",
                     Severity::Crit,
                     "UPS not reporting status",
@@ -172,7 +179,7 @@ fn check_ups_comms(dir: &Path) -> Option<Finding> {
                         "ups-comms",
                         "Restart the NUT driver so the UPS reports status (privileged)",
                     )),
-                ))
+                )
             }
         }
     }
@@ -180,7 +187,10 @@ fn check_ups_comms(dir: &Path) -> Option<Finding> {
 
 /// `battery-thresholds`: `MINSUPPLIES` / low-battery timing unsafe vs the
 /// reported runtime. Reads live `battery.runtime` when upsd is reachable.
-fn check_battery_thresholds(upsmon: &Option<UpsmonSettings>) -> Option<Finding> {
+fn check_battery_thresholds(
+    upsmon: &Option<UpsmonSettings>,
+    live_runtime: Option<f64>,
+) -> Option<Finding> {
     let upsmon = upsmon.as_ref()?;
     // MINSUPPLIES 0 disables shutdown entirely — the host will never power off.
     if upsmon.min_supplies == 0 {
@@ -199,7 +209,7 @@ fn check_battery_thresholds(upsmon: &Option<UpsmonSettings>) -> Option<Finding> 
     }
     // If we can read live runtime, sanity-check that HOSTSYNC + shutdown headroom
     // fits inside the reported low-battery runtime.
-    if let Some(runtime) = live_battery_runtime() {
+    if let Some(runtime) = live_runtime {
         let needed = (upsmon.host_sync + upsmon.dead_time) as f64;
         if runtime < needed {
             return Some(finding(
@@ -373,11 +383,9 @@ fn check_onbattery_capture(upssched: &str) -> Option<Finding> {
 
 // ── repair ───────────────────────────────────────────────────────────────────
 
-/// Run one repair by id and return a [`RepairOutcome`] as JSON. Delegated
+/// Run one repair by id and return the typed [`RepairOutcome`]. Delegated
 /// repairs (`shutdown-command`) are dispatched core-side and never reach here.
-pub fn repair(args_json: &str) -> Result<String, String> {
-    let args: RepairArgs =
-        serde_json::from_str(args_json).map_err(|e| format!("invalid repair args: {e}"))?;
+pub fn repair_typed(args: RepairArgs) -> RepairOutcome {
     let (ok, message) = match args.repair_id.as_str() {
         "ups-comms" => repair_ups_comms(),
         "battery-thresholds" => repair_write_config("safe battery thresholds"),
@@ -388,13 +396,12 @@ pub fn repair(args_json: &str) -> Result<String, String> {
         "apcupsd-active" => repair_apcupsd_migrate(),
         other => (false, format!("nut has no in-place repair '{other}'")),
     };
-    let outcome = RepairOutcome {
+    RepairOutcome {
         id: args.repair_id,
         provider: crate::PROVIDER.to_string(),
         ok,
         message,
-    };
-    serde_json::to_string(&outcome).map_err(|e| format!("encode outcome: {e}"))
+    }
 }
 
 /// Re-render the managed config with the safe defaults and write it
@@ -563,17 +570,6 @@ fn unquote_field(s: &str) -> String {
         .to_string()
 }
 
-/// Read the live `battery.runtime` (seconds) from the first reporting UPS, if
-/// `upsd` is reachable. Best-effort — `None` when it isn't.
-fn live_battery_runtime() -> Option<f64> {
-    let host = upsd_host();
-    let upses: Vec<Ups> = reactor::block_on(async move {
-        let mut c = NutClient::connect(&host, DEFAULT_PORT).await.ok()?;
-        c.list_upses().await.ok()
-    })?;
-    upses.iter().find_map(|u| u.battery_runtime())
-}
-
 fn ups_comms_summary(upses: &[Ups]) -> String {
     let parts: Vec<String> = upses
         .iter()
@@ -667,7 +663,7 @@ DEADTIME 15
     #[test]
     fn battery_thresholds_flags_minsupplies_zero() {
         let s = read_upsmon(write_upsmon(UPSMON_UNSAFE).path());
-        let f = check_battery_thresholds(&s).expect("finding");
+        let f = check_battery_thresholds(&s, None).expect("finding");
         assert_eq!(f.severity, Severity::Warn);
         assert_eq!(f.id, "battery-thresholds");
         assert!(f.repair.is_some());
@@ -676,7 +672,7 @@ DEADTIME 15
     #[test]
     fn battery_thresholds_ok_when_safe() {
         let s = read_upsmon(write_upsmon(UPSMON_SAFE).path());
-        let f = check_battery_thresholds(&s).expect("finding");
+        let f = check_battery_thresholds(&s, None).expect("finding");
         // No live upsd in the test env, so it only checks MINSUPPLIES here.
         assert_eq!(f.severity, Severity::Ok);
         assert!(f.repair.is_none());
@@ -774,16 +770,18 @@ DEADTIME 15
 
     #[test]
     fn repair_unknown_id_reports_not_ok() {
-        let out = repair(r#"{"provider":"nut","repair_id":"nope"}"#).expect("encodes");
-        let o: RepairOutcome = serde_json::from_str(&out).unwrap();
+        let o = repair_typed(RepairArgs {
+            provider: "nut".to_string(),
+            repair_id: "nope".to_string(),
+            confirm: false,
+        });
         assert!(!o.ok);
         assert!(o.message.contains("no in-place repair"));
     }
 
-    #[test]
-    fn diagnose_emits_valid_json_array() {
-        let out = diagnose("{}").expect("diagnose ok");
-        let findings: Vec<Finding> = serde_json::from_str(&out).expect("valid findings json");
+    #[tokio::test]
+    async fn diagnose_emits_typed_findings() {
+        let findings = diagnose_typed(DiagnoseArgs::default()).await;
         for f in &findings {
             assert_eq!(f.provider, crate::PROVIDER);
         }
