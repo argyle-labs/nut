@@ -9,8 +9,6 @@
 use std::env;
 
 use plugin_toolkit::contract::ups::{UpsConfig, UpsConfigOutcome, UpsQueryArgs, UpsState};
-use plugin_toolkit::reactor;
-use plugin_toolkit::serde_json;
 
 use crate::client::{NutClient, Ups, DEFAULT_PORT};
 use crate::config::{detect_conf_dir, NutConfig};
@@ -43,51 +41,37 @@ fn to_state(u: &Ups) -> UpsState {
     }
 }
 
-fn parse_query(args_json: &str) -> UpsQueryArgs {
-    if args_json.trim().is_empty() {
-        UpsQueryArgs::default()
-    } else {
-        serde_json::from_str(args_json).unwrap_or_default()
-    }
-}
-
-/// `state` op — live UPS readings from `upsd`.
-pub fn state(args_json: &str) -> Result<String, String> {
-    let args = parse_query(args_json);
-    let states: Vec<UpsState> = reactor::block_on(async {
-        let mut client = NutClient::connect(&upsd_host(), DEFAULT_PORT).await?;
-        let upses = client.list_upses().await?;
-        Ok::<Vec<UpsState>, String>(upses.iter().map(to_state).collect())
-    })?
-    .into_iter()
-    .filter(|s| args.id.as_ref().is_none_or(|id| &s.id == id))
-    .collect();
-    serde_json::to_string(&states).map_err(|e| format!("encode ups state: {e}"))
+/// `state` op — live UPS readings from `upsd`. Awaited directly on the shared
+/// reactor (the provider future already runs under it).
+pub async fn state_typed(args: UpsQueryArgs) -> Result<Vec<UpsState>, String> {
+    let mut client = NutClient::connect(&upsd_host(), DEFAULT_PORT).await?;
+    let upses = client.list_upses().await?;
+    Ok(upses
+        .iter()
+        .map(to_state)
+        .filter(|s| args.id.as_ref().is_none_or(|id| &s.id == id))
+        .collect())
 }
 
 /// `config_get` op — the power/shutdown knobs nut manages (kill-power +
 /// SHUTDOWNCMD). Threshold fields are apcupsd-shaped and left `None` here; the
 /// unraid provider fills those for Unraid hosts.
-pub fn config_get(args_json: &str) -> Result<String, String> {
-    let args = parse_query(args_json);
+pub fn config_get_typed(args: UpsQueryArgs) -> Vec<UpsConfig> {
     let dir = detect_conf_dir();
     let upsmon = crate::checks::read_upsmon(&dir).unwrap_or_default();
     let id = args.id.unwrap_or_else(|| "default".to_string());
-    let cfg = UpsConfig {
+    vec![UpsConfig {
         id,
         kill_power: Some(upsmon.kill_power),
         shutdown_cmd: (!upsmon.shutdown_cmd.trim().is_empty()).then(|| upsmon.shutdown_cmd.clone()),
         ..Default::default()
-    };
-    serde_json::to_string(&vec![cfg]).map_err(|e| format!("encode ups config: {e}"))
+    }]
 }
 
 /// `config_set` op — apply kill-power / SHUTDOWNCMD onto upsmon.conf idempotently,
 /// merging onto whatever is already configured so an operator's UPS/monitor
 /// topology is preserved.
-pub fn config_set(args_json: &str) -> Result<String, String> {
-    let cfg: UpsConfig =
-        serde_json::from_str(args_json).map_err(|e| format!("invalid ups config: {e}"))?;
+pub fn config_set_typed(cfg: UpsConfig) -> UpsConfigOutcome {
     let dir = detect_conf_dir();
     let mut nut = NutConfig {
         upsmon: crate::checks::read_upsmon(&dir).unwrap_or_default(),
@@ -101,7 +85,7 @@ pub fn config_set(args_json: &str) -> Result<String, String> {
             nut.upsmon.shutdown_cmd = s.clone();
         }
     }
-    let outcome = match nut.apply(&dir) {
+    match nut.apply(&dir) {
         Ok(written) if written.is_empty() => UpsConfigOutcome {
             id: cfg.id,
             provider: crate::PROVIDER.to_string(),
@@ -126,8 +110,7 @@ pub fn config_set(args_json: &str) -> Result<String, String> {
             ),
             restart_required: false,
         },
-    };
-    serde_json::to_string(&outcome).map_err(|e| format!("encode ups outcome: {e}"))
+    }
 }
 
 #[cfg(test)]
@@ -137,13 +120,8 @@ mod tests {
     #[test]
     fn config_get_reports_kill_power_default() {
         // No config dir → defaults; kill_power is always reported (Some).
-        let out = config_get("{}").expect("ok");
-        assert!(out.contains("\"kill_power\""));
-    }
-
-    #[test]
-    fn config_set_rejects_bad_json() {
-        assert!(config_set("not json").is_err());
+        let cfgs = config_get_typed(UpsQueryArgs::default());
+        assert!(cfgs.iter().any(|c| c.kill_power.is_some()));
     }
 
     #[test]
