@@ -94,12 +94,16 @@ impl ServiceBackend for NutBackend {
         ep: &'a Endpoint,
     ) -> BoxFuture<'a, Result<WorkloadSpec, ServiceError>> {
         Box::pin(async move {
-            // A monitor-only client publishes no port and needs no device.
-            let netclient = ep.base_url.contains("netclient");
+            // A monitor-only client publishes no port and needs no device. The
+            // mode marker rides a route value (schemeless), read directly.
+            let netclient = ep.routes.enabled().any(|r| r.value == "netclient");
             let ports = if netclient {
                 Vec::new()
             } else {
-                vec![format!("{DEFAULT_PORT}:{DEFAULT_PORT}")]
+                // Host bind = the instance's lan_v4 route port (falls back to the
+                // upsd default), so multiple nut instances coexist on one host.
+                let host_port = ep.publish_port(DEFAULT_PORT);
+                vec![format!("{host_port}:{DEFAULT_PORT}")]
             };
             Ok(WorkloadSpec {
                 name: if ep.name.is_empty() {
@@ -190,14 +194,16 @@ impl ServiceBackend for NutBackend {
     }
 }
 
-/// Host `upsd` is reached at for this instance: the endpoint's host when given,
-/// else loopback (the netserver monitors itself).
+/// Host `upsd` is reached at for this instance: the primary route's host when
+/// one is set, else loopback (a netserver monitors its own upsd). Walks the
+/// first-class `routes` — the `value` is the bare host, so no URL parsing and no
+/// scalar base_url. The `netclient`/`netserver` mode marker (carried in the
+/// route value historically) is ignored as a host.
 fn upsd_host(ep: &Endpoint) -> String {
-    ep.base_url
-        .trim()
-        .trim_start_matches("nut://")
-        .split(&['/', ':'][..])
-        .find(|s| !s.is_empty() && *s != "netclient" && *s != "netserver")
+    ep.routes
+        .enabled()
+        .map(|r| r.value.as_str())
+        .find(|v| !v.is_empty() && *v != "netclient" && *v != "netserver")
         .map(str::to_string)
         .unwrap_or_else(|| "127.0.0.1".to_string())
 }
@@ -205,6 +211,7 @@ fn upsd_host(ep: &Endpoint) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use plugin_toolkit::service::{Route, Routes};
 
     #[test]
     fn declares_provider() {
@@ -227,11 +234,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workload_spec_netserver_binds_instance_lan_port() {
+        // A second nut instance on the same host binds its own lan_v4 port so it
+        // does not collide with the first (3493) — the multi-instance guarantee.
+        let b = NutBackend::new("nut");
+        let ep = Endpoint {
+            name: "rack-ups-2".to_string(),
+            routes: Routes::from(vec![Route::new("lan_v4", "http", "127.0.0.1", Some(3494))]),
+            ..Default::default()
+        };
+        let spec = b.workload_spec(Runtime::Docker, &ep).await.unwrap();
+        assert_eq!(spec.ports, vec!["3494:3493".to_string()]);
+    }
+
+    #[tokio::test]
     async fn workload_spec_netclient_publishes_no_port() {
         let b = NutBackend::new("nut");
         let ep = Endpoint {
             name: "watcher".to_string(),
-            base_url: "nut://netclient".to_string(),
+            routes: Routes::from(vec![Route::mesh("lan_v4", "netclient", None)]),
             ..Default::default()
         };
         let spec = b.workload_spec(Runtime::Lxc, &ep).await.unwrap();
@@ -248,7 +269,12 @@ mod tests {
     #[test]
     fn upsd_host_reads_endpoint_host() {
         let ep = Endpoint {
-            base_url: "nut://ups-host.example.invalid:3493".to_string(),
+            routes: Routes::from(vec![Route::new(
+                "lan_v4",
+                "http",
+                "ups-host.example.invalid",
+                Some(3493),
+            )]),
             ..Default::default()
         };
         assert_eq!(upsd_host(&ep), "ups-host.example.invalid");
