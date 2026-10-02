@@ -11,7 +11,7 @@
 use plugin_toolkit::deploy_target::EnvVar;
 use plugin_toolkit::serde_json;
 use plugin_toolkit::service::{
-    BoxFuture, Endpoint, Runtime, ServiceBackend, ServiceCapability, ServiceError, ServiceStatus,
+    BoxFuture, Routes, Runtime, ServiceBackend, ServiceCapability, ServiceError, ServiceStatus,
     WorkloadSpec,
 };
 
@@ -33,7 +33,7 @@ pub const PROVIDER: &str = "nut";
 const NUT_IMAGE: &str = "docker.io/instantlinux/nut-upsd:latest";
 
 /// nut backend. Holds only the provider name; per-instance endpoint/creds
-/// come from the `Endpoint` the generic `service.*` tools hand each op.
+/// come from the instance id and `Routes` the generic `service.*` tools hand each op.
 #[derive(Debug, Clone)]
 pub struct NutBackend {
     provider: &'static str,
@@ -83,7 +83,7 @@ impl ServiceBackend for NutBackend {
     /// - **netserver** — drives the UPS hardware and serves `upsd` on 3493; the
     ///   host must pass the UPS device through (USB/serial). This is the default.
     /// - **monitor-only client** — no local UPS; watches a remote `upsd`. The
-    ///   deployer signals this with `MODE=netclient` on the endpoint, and no
+    ///   deployer signals this with `MODE=netclient` on a route, and no
     ///   port is published.
     ///
     /// The concrete UPS device and driver are host-specific and applied via
@@ -91,25 +91,26 @@ impl ServiceBackend for NutBackend {
     fn workload_spec<'a>(
         &'a self,
         _runtime: Runtime,
-        ep: &'a Endpoint,
+        instance: &'a str,
+        routes: &'a Routes,
     ) -> BoxFuture<'a, Result<WorkloadSpec, ServiceError>> {
         Box::pin(async move {
             // A monitor-only client publishes no port and needs no device. The
             // mode marker rides a route value (schemeless), read directly.
-            let netclient = ep.routes.enabled().any(|r| r.value == "netclient");
+            let netclient = routes.enabled().any(|r| r.value == "netclient");
             let ports = if netclient {
                 Vec::new()
             } else {
                 // Host bind = the instance's lan_v4 route port (falls back to the
                 // upsd default), so multiple nut instances coexist on one host.
-                let host_port = ep.publish_port(DEFAULT_PORT);
+                let host_port = routes.publish_port(DEFAULT_PORT);
                 vec![format!("{host_port}:{DEFAULT_PORT}")]
             };
             Ok(WorkloadSpec {
-                name: if ep.name.is_empty() {
+                name: if instance.is_empty() {
                     PROVIDER.to_string()
                 } else {
-                    ep.name.clone()
+                    instance.to_string()
                 },
                 image: Some(NUT_IMAGE.to_string()),
                 env: vec![EnvVar {
@@ -129,7 +130,8 @@ impl ServiceBackend for NutBackend {
     /// files is deterministic and only rewrites what changed.
     fn configure<'a>(
         &'a self,
-        _ep: &'a Endpoint,
+        _instance: &'a str,
+        _routes: &'a Routes,
         config: &'a str,
     ) -> BoxFuture<'a, Result<(), ServiceError>> {
         Box::pin(async move {
@@ -146,10 +148,11 @@ impl ServiceBackend for NutBackend {
     /// enum is owned centrally by orca and has no nut variant yet).
     fn status<'a>(
         &'a self,
-        ep: &'a Endpoint,
+        _instance: &'a str,
+        routes: &'a Routes,
     ) -> BoxFuture<'a, Result<ServiceStatus, ServiceError>> {
         Box::pin(async move {
-            let host = upsd_host(ep);
+            let host = upsd_host(routes);
             let mut client = NutClient::connect(&host, DEFAULT_PORT)
                 .await
                 .map_err(ServiceError::Transport)?;
@@ -199,8 +202,8 @@ impl ServiceBackend for NutBackend {
 /// first-class `routes` — the `value` is the bare host, so no URL parsing and no
 /// scalar base_url. The `netclient`/`netserver` mode marker (carried in the
 /// route value historically) is ignored as a host.
-fn upsd_host(ep: &Endpoint) -> String {
-    ep.routes
+fn upsd_host(routes: &Routes) -> String {
+    routes
         .enabled()
         .map(|r| r.value.as_str())
         .find(|v| !v.is_empty() && *v != "netclient" && *v != "netserver")
@@ -223,11 +226,11 @@ mod tests {
     #[tokio::test]
     async fn workload_spec_netserver_publishes_port() {
         let b = NutBackend::new("nut");
-        let ep = Endpoint {
-            name: "rack-ups".to_string(),
-            ..Default::default()
-        };
-        let spec = b.workload_spec(Runtime::Docker, &ep).await.unwrap();
+        let routes = Routes::new();
+        let spec = b
+            .workload_spec(Runtime::Docker, "rack-ups", &routes)
+            .await
+            .unwrap();
         assert_eq!(spec.name, "rack-ups");
         assert_eq!(spec.ports, vec!["3493:3493".to_string()]);
         assert!(spec.env.iter().any(|e| e.value == "netserver"));
@@ -238,45 +241,40 @@ mod tests {
         // A second nut instance on the same host binds its own lan_v4 port so it
         // does not collide with the first (3493) — the multi-instance guarantee.
         let b = NutBackend::new("nut");
-        let ep = Endpoint {
-            name: "rack-ups-2".to_string(),
-            routes: Routes::from(vec![Route::new("lan_v4", "http", "127.0.0.1", Some(3494))]),
-            ..Default::default()
-        };
-        let spec = b.workload_spec(Runtime::Docker, &ep).await.unwrap();
+        let routes = Routes::from(vec![Route::new("lan_v4", "http", "127.0.0.1", Some(3494))]);
+        let spec = b
+            .workload_spec(Runtime::Docker, "rack-ups-2", &routes)
+            .await
+            .unwrap();
         assert_eq!(spec.ports, vec!["3494:3493".to_string()]);
     }
 
     #[tokio::test]
     async fn workload_spec_netclient_publishes_no_port() {
         let b = NutBackend::new("nut");
-        let ep = Endpoint {
-            name: "watcher".to_string(),
-            routes: Routes::from(vec![Route::mesh("lan_v4", "netclient", None)]),
-            ..Default::default()
-        };
-        let spec = b.workload_spec(Runtime::Lxc, &ep).await.unwrap();
+        let routes = Routes::from(vec![Route::mesh("lan_v4", "netclient", None)]);
+        let spec = b
+            .workload_spec(Runtime::Lxc, "watcher", &routes)
+            .await
+            .unwrap();
         assert!(spec.ports.is_empty());
         assert!(spec.env.iter().any(|e| e.value == "netclient"));
     }
 
     #[test]
     fn upsd_host_falls_back_to_loopback() {
-        let ep = Endpoint::default();
-        assert_eq!(upsd_host(&ep), "127.0.0.1");
+        let routes = Routes::new();
+        assert_eq!(upsd_host(&routes), "127.0.0.1");
     }
 
     #[test]
-    fn upsd_host_reads_endpoint_host() {
-        let ep = Endpoint {
-            routes: Routes::from(vec![Route::new(
-                "lan_v4",
-                "http",
-                "ups-host.example.invalid",
-                Some(3493),
-            )]),
-            ..Default::default()
-        };
-        assert_eq!(upsd_host(&ep), "ups-host.example.invalid");
+    fn upsd_host_reads_route_host() {
+        let routes = Routes::from(vec![Route::new(
+            "lan_v4",
+            "http",
+            "ups-host.example.invalid",
+            Some(3493),
+        )]);
+        assert_eq!(upsd_host(&routes), "ups-host.example.invalid");
     }
 }
