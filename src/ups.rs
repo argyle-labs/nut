@@ -68,7 +68,8 @@ pub fn config_get_typed(args: UpsQueryArgs) -> Vec<UpsConfig> {
     }]
 }
 
-/// `config_set` op — apply kill-power / SHUTDOWNCMD onto upsmon.conf idempotently,
+/// `config_set` op — apply kill-power / SHUTDOWNCMD onto upsmon.conf idempotently
+/// (apply restarts the daemons itself, so `restart_required` is always false),
 /// merging onto whatever is already configured so an operator's UPS/monitor
 /// topology is preserved.
 pub fn config_set_typed(cfg: UpsConfig) -> UpsConfigOutcome {
@@ -98,7 +99,7 @@ pub fn config_set_typed(cfg: UpsConfig) -> UpsConfigOutcome {
             provider: crate::PROVIDER.to_string(),
             ok: true,
             message: format!("wrote {} in {}", written.join(", "), dir.display()),
-            restart_required: true,
+            restart_required: false,
         },
         Err(e) => UpsConfigOutcome {
             id: cfg.id,

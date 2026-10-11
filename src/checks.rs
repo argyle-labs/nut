@@ -606,7 +606,7 @@ fn which(bin: &str) -> Option<PathBuf> {
 }
 
 /// Run a command, returning `Ok` on success or the first stderr line on failure.
-fn run(bin: &str, args: &[&str]) -> Result<String, String> {
+pub(crate) fn run(bin: &str, args: &[&str]) -> Result<String, String> {
     let out = std::process::Command::new(bin)
         .args(args)
         .output()

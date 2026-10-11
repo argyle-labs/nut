@@ -12,7 +12,10 @@
 //! - **monitor-only client** — no local UPS; it monitors a `upsd` running on
 //!   another host (an empty `upses` list, `monitors` pointing elsewhere).
 
+use std::io::Write;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -192,19 +195,54 @@ impl NutConfig {
     /// Write every rendered file into `dir`, only touching files whose content
     /// changed. Returns the names of the files actually written (empty = no-op).
     pub fn apply(&self, dir: &Path) -> Result<Vec<String>, String> {
+        self.apply_with(dir, &SystemServices)
+    }
+
+    /// [`apply`](Self::apply) with injectable service control. When anything
+    /// changed, the daemons are stopped around the writes and always started
+    /// again, even if a write failed.
+    pub fn apply_with(
+        &self,
+        dir: &Path,
+        services: &dyn ServiceControl,
+    ) -> Result<Vec<String>, String> {
         std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-        let mut written = Vec::new();
-        for file in self.render() {
-            let path = dir.join(file.name);
-            let current = std::fs::read_to_string(&path).ok();
-            if current.as_deref() == Some(file.contents.as_str()) {
-                continue; // idempotent: identical content, skip the write.
-            }
-            std::fs::write(&path, &file.contents)
-                .map_err(|e| format!("write {}: {e}", path.display()))?;
-            written.push(file.name.to_string());
+        let changed: Vec<RenderedFile> = self
+            .render()
+            .into_iter()
+            .filter(|f| {
+                std::fs::read_to_string(dir.join(f.name)).ok().as_deref()
+                    != Some(f.contents.as_str())
+            })
+            .collect();
+        if changed.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(written)
+        // A stop failure (e.g. monitor-only host without nut-server) is not
+        // fatal: writes are atomic, so a running daemon never sees a torn file.
+        let _stopped = services.stop();
+        let mut written = Vec::new();
+        let mut write_err = None;
+        for file in &changed {
+            let path = dir.join(file.name);
+            match write_atomic(&path, file.contents.as_bytes()) {
+                Ok(()) => written.push(file.name.to_string()),
+                Err(e) => {
+                    write_err = Some(e);
+                    break;
+                }
+            }
+        }
+        let started = services.start();
+        match (write_err, started) {
+            (None, Ok(())) => Ok(written),
+            (None, Err(s)) => Err(format!(
+                "wrote {} but NUT services failed to restart: {s}",
+                written.join(", ")
+            )),
+            (Some(w), Ok(())) => Err(format!("{w}; NUT services restarted")),
+            (Some(w), Err(s)) => Err(format!("{w}; NUT services failed to restart: {s}")),
+        }
     }
 
     fn render_ups_conf(&self) -> String {
@@ -299,6 +337,95 @@ pub fn detect_conf_dir() -> PathBuf {
     PathBuf::from(DEFAULT_CONF_DIR)
 }
 
+/// Stops/starts the NUT daemons around a config write.
+pub trait ServiceControl {
+    fn stop(&self) -> Result<(), String>;
+    fn start(&self) -> Result<(), String>;
+}
+
+/// Real service control: systemd, falling back to OpenRC.
+pub struct SystemServices;
+
+impl ServiceControl for SystemServices {
+    fn stop(&self) -> Result<(), String> {
+        let systemd = crate::checks::run("systemctl", &["stop", "nut-monitor", "nut-server"]);
+        if systemd.is_ok() || crate::checks::run("rc-service", &["nut-server", "stop"]).is_ok() {
+            return Ok(());
+        }
+        systemd.map(|_| ())
+    }
+
+    fn start(&self) -> Result<(), String> {
+        let systemd = crate::checks::run("systemctl", &["start", "nut-server", "nut-monitor"]);
+        if systemd.is_ok() || crate::checks::run("rc-service", &["nut-server", "start"]).is_ok() {
+            return Ok(());
+        }
+        systemd.map(|_| ())
+    }
+}
+
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Replace `path` atomically: same-dir temp file created with the final mode,
+/// fsync, rename, fsync the directory. Keeps the existing file's mode/uid/gid;
+/// a new file gets 0640 root:nut (upsmon.conf carries the MONITOR password).
+fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), String> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let existing = std::fs::metadata(path).ok();
+    let (mode, uid, gid) = match &existing {
+        Some(m) => (m.mode() & 0o7777, Some(m.uid()), Some(m.gid())),
+        None => (0o640, Some(0), nut_gid()),
+    };
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("conf");
+    let tmp = dir.join(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&tmp)
+            .map_err(|e| format!("create {}: {e}", tmp.display()))?;
+        // `mode()` is masked by the umask; set it explicitly.
+        f.set_permissions(std::fs::Permissions::from_mode(mode))
+            .map_err(|e| format!("chmod {}: {e}", tmp.display()))?;
+        // Unprivileged callers cannot chown a new file to root:nut; that is
+        // tolerated, but failing to preserve an existing owner is an error.
+        if let Err(e) = std::os::unix::fs::fchown(&f, uid, gid) {
+            let m = f
+                .metadata()
+                .map_err(|e| format!("stat {}: {e}", tmp.display()))?;
+            let mismatch = uid.is_some_and(|u| u != m.uid()) || gid.is_some_and(|g| g != m.gid());
+            if existing.is_some() && mismatch {
+                return Err(format!("chown {}: {e}", tmp.display()));
+            }
+        }
+        f.write_all(contents)
+            .and_then(|_| f.sync_all())
+            .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, path).map_err(|e| format!("rename {}: {e}", path.display()))?;
+        std::fs::File::open(dir)
+            .and_then(|d| d.sync_all())
+            .map_err(|e| format!("fsync {}: {e}", dir.display()))
+    })();
+    if result.is_err() {
+        let _removed = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// gid of the `nut` group from /etc/group, if present.
+fn nut_gid() -> Option<u32> {
+    let groups = std::fs::read_to_string("/etc/group").ok()?;
+    groups.lines().find_map(|l| {
+        let mut parts = l.split(':');
+        (parts.next()? == "nut").then(|| parts.nth(1)?.parse().ok())?
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,9 +474,10 @@ mod tests {
     fn apply_round_trips_idempotently() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = sample();
-        let first = cfg.apply(dir.path()).unwrap();
+        let svc = MockServices::default();
+        let first = cfg.apply_with(dir.path(), &svc).unwrap();
         assert_eq!(first.len(), 4, "first apply writes all four files");
-        let second = cfg.apply(dir.path()).unwrap();
+        let second = cfg.apply_with(dir.path(), &svc).unwrap();
         assert!(second.is_empty(), "re-apply is a no-op: {second:?}");
     }
 
@@ -389,5 +517,93 @@ mod tests {
         );
         let mon = cfg.render_upsmon_conf();
         assert!(mon.contains("MONITOR serverups@upshost 1 monuser secretref slave"));
+    }
+    #[derive(Default)]
+    struct MockServices {
+        stops: std::cell::Cell<u32>,
+        starts: std::cell::Cell<u32>,
+    }
+
+    impl ServiceControl for MockServices {
+        fn stop(&self) -> Result<(), String> {
+            self.stops.set(self.stops.get() + 1);
+            Ok(())
+        }
+        fn start(&self) -> Result<(), String> {
+            self.starts.set(self.starts.get() + 1);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn atomic_write_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        sample()
+            .apply_with(dir.path(), &MockServices::default())
+            .unwrap();
+        let mut names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["ups.conf", "upsd.conf", "upsmon.conf", "upssched.conf"]
+        );
+    }
+
+    #[test]
+    fn new_file_is_0640_and_existing_mode_owner_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let mon = dir.path().join("upsmon.conf");
+        sample()
+            .apply_with(dir.path(), &MockServices::default())
+            .unwrap();
+        assert_eq!(std::fs::metadata(&mon).unwrap().mode() & 0o7777, 0o640);
+
+        std::fs::write(&mon, "stale").unwrap();
+        std::fs::set_permissions(&mon, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let before = std::fs::metadata(&mon).unwrap();
+        sample()
+            .apply_with(dir.path(), &MockServices::default())
+            .unwrap();
+        let after = std::fs::metadata(&mon).unwrap();
+        assert_eq!(after.mode() & 0o7777, 0o600);
+        assert_eq!((after.uid(), after.gid()), (before.uid(), before.gid()));
+        assert_ne!(after.ino(), before.ino(), "replaced via rename");
+    }
+
+    #[test]
+    fn unchanged_config_does_not_stop_services() {
+        let dir = tempfile::tempdir().unwrap();
+        sample()
+            .apply_with(dir.path(), &MockServices::default())
+            .unwrap();
+        let svc = MockServices::default();
+        sample().apply_with(dir.path(), &svc).unwrap();
+        assert_eq!((svc.stops.get(), svc.starts.get()), (0, 0));
+    }
+
+    #[test]
+    fn write_failure_still_restarts_services() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory where a file must go makes the rename fail.
+        std::fs::create_dir(dir.path().join("upsd.conf")).unwrap();
+        std::fs::write(dir.path().join("upsd.conf").join("x"), "").unwrap();
+        let svc = MockServices::default();
+        let err = sample().apply_with(dir.path(), &svc).unwrap_err();
+        assert!(err.contains("NUT services restarted"), "{err}");
+        assert_eq!((svc.stops.get(), svc.starts.get()), (1, 1));
+        let leftovers = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
     }
 }
