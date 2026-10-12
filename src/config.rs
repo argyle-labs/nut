@@ -42,6 +42,18 @@ pub struct NutConfig {
     /// any on-disk UPS not listed here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remove_upses: Vec<String>,
+    /// Unmodelled `ups.conf` global lines (before the first section), kept verbatim.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ups_globals: Vec<String>,
+    /// Unmodelled `upsd.conf` lines (everything but `LISTEN`), kept verbatim.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub upsd_extra: Vec<String>,
+    /// Unmodelled `upsmon.conf` lines, kept verbatim.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub upsmon_extra: Vec<String>,
+    /// An operator-written `upssched.conf`, kept verbatim instead of the managed one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upssched_custom: Option<String>,
 }
 
 /// One UPS section in `ups.conf` (`[name]` + `driver`/`port`/…).
@@ -52,7 +64,8 @@ pub struct UpsDef {
     pub port: String,
     #[serde(default)]
     pub description: String,
-    /// Extra driver options rendered verbatim as `key = value` lines.
+    /// Extra driver options rendered verbatim as `key = value` lines; an empty
+    /// value renders as a bare flag (`nolock`).
     #[serde(default)]
     pub extra: Vec<(String, String)>,
 }
@@ -163,6 +176,12 @@ impl Default for NotifySettings {
     }
 }
 
+const MANAGED_HEADER: &str = "# Managed by orca (nut plugin). Do not edit by hand.\n";
+
+const MANAGED_EVENTS: [&str; 6] = [
+    "ONLINE", "ONBATT", "LOWBATT", "COMMBAD", "COMMOK", "SHUTDOWN",
+];
+
 /// The default config directory NUT reads on most Linux hosts.
 pub const DEFAULT_CONF_DIR: &str = "/etc/nut";
 
@@ -175,14 +194,24 @@ pub struct RenderedFile {
 
 impl NutConfig {
     /// The topology and settings currently on disk in `dir`; missing files
-    /// read as empty. `notify` is left at its default.
+    /// read as empty. `notify` is left at its default; unmodelled lines are
+    /// carried as passthrough so applying the result loses nothing.
     pub fn read_existing(dir: &Path) -> Self {
         let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap_or_default();
+        let ups = read("ups.conf");
+        let upsd = read("upsd.conf");
+        let upsmon = read("upsmon.conf");
+        let upssched = read("upssched.conf");
         Self {
-            upses: parse_ups_conf(&read("ups.conf")),
-            listen: parse_upsd_conf(&read("upsd.conf")),
-            monitors: parse_monitors(&read("upsmon.conf")),
+            upses: parse_ups_conf(&ups),
+            listen: parse_upsd_conf(&upsd),
+            monitors: parse_monitors(&upsmon),
             upsmon: crate::checks::read_upsmon(dir).unwrap_or_default(),
+            ups_globals: parse_ups_globals(&ups),
+            upsd_extra: parse_upsd_extra(&upsd),
+            upsmon_extra: parse_upsmon_extra(&upsmon),
+            upssched_custom: (!upssched.trim().is_empty() && !upssched.starts_with(MANAGED_HEADER))
+                .then_some(upssched),
             ..Default::default()
         }
     }
@@ -234,8 +263,59 @@ impl NutConfig {
                     .to_string(),
             );
         }
-        let on_disk =
-            parse_ups_conf(&std::fs::read_to_string(dir.join("ups.conf")).unwrap_or_default());
+        let ups_text = std::fs::read_to_string(dir.join("ups.conf")).unwrap_or_default();
+        let on_disk = parse_ups_conf(&ups_text);
+        let raw_sections = ups_text
+            .lines()
+            .filter(|l| strip_comment(l).trim().starts_with('['))
+            .count();
+        if raw_sections != on_disk.len() {
+            return Err(format!(
+                "refusing to apply: ups.conf has {raw_sections} [section] headers but only {} \
+                 parsed; fix it by hand first",
+                on_disk.len()
+            ));
+        }
+        let upsmon_text = std::fs::read_to_string(dir.join("upsmon.conf")).unwrap_or_default();
+        let raw_monitors = upsmon_text
+            .lines()
+            .filter(|l| tokenize(l).first().is_some_and(|t| t == "MONITOR"))
+            .count();
+        if raw_monitors > self.monitors.len() {
+            return Err(format!(
+                "refusing to apply: upsmon.conf has {raw_monitors} MONITOR lines but the \
+                 config carries only {}",
+                self.monitors.len()
+            ));
+        }
+        let missing_local: Vec<&str> = self
+            .monitors
+            .iter()
+            .filter_map(|m| {
+                let (ups, host) = m.system.split_once('@')?;
+                let host = host.split(':').next().unwrap_or(host);
+                matches!(host, "localhost" | "127.0.0.1").then_some(ups)
+            })
+            .filter(|ups| !self.upses.iter().any(|u| u.name == *ups))
+            .collect();
+        if !missing_local.is_empty() {
+            return Err(format!(
+                "refusing to apply: local MONITOR refers to UPS {} not defined in upses",
+                missing_local.join(", ")
+            ));
+        }
+        let unknown: Vec<&str> = self
+            .remove_upses
+            .iter()
+            .map(String::as_str)
+            .filter(|r| !on_disk.iter().any(|u| u.name == *r))
+            .collect();
+        if !unknown.is_empty() {
+            return Err(format!(
+                "refusing to apply: remove_upses lists {} which is not in ups.conf",
+                unknown.join(", ")
+            ));
+        }
         let dropped: Vec<&str> = on_disk
             .iter()
             .map(|u| u.name.as_str())
@@ -331,7 +411,10 @@ impl NutConfig {
     }
 
     fn render_ups_conf(&self) -> String {
-        let mut out = String::from("# Managed by orca (nut plugin). Do not edit by hand.\n");
+        let mut out = String::from(MANAGED_HEADER);
+        for line in &self.ups_globals {
+            out.push_str(&format!("{line}\n"));
+        }
         for ups in &self.upses {
             out.push_str(&format!("\n[{}]\n", ups.name));
             out.push_str(&format!("    driver = {}\n", ups.driver));
@@ -340,19 +423,26 @@ impl NutConfig {
                 out.push_str(&format!("    desc = \"{}\"\n", ups.description));
             }
             for (k, v) in &ups.extra {
-                out.push_str(&format!("    {k} = {v}\n"));
+                if v.is_empty() {
+                    out.push_str(&format!("    {k}\n"));
+                } else {
+                    out.push_str(&format!("    {k} = {v}\n"));
+                }
             }
         }
         out
     }
 
     fn render_upsd_conf(&self) -> String {
-        let mut out = String::from("# Managed by orca (nut plugin). Do not edit by hand.\n");
+        let mut out = String::from(MANAGED_HEADER);
         for l in &self.listen {
             match l.port {
                 Some(p) => out.push_str(&format!("LISTEN {} {p}\n", l.address)),
                 None => out.push_str(&format!("LISTEN {}\n", l.address)),
             }
+        }
+        for line in &self.upsd_extra {
+            out.push_str(&format!("{line}\n"));
         }
         out
     }
@@ -360,38 +450,47 @@ impl NutConfig {
     fn render_upsmon_conf(&self) -> String {
         let s = &self.upsmon;
         let n = &self.notify;
-        let mut out = String::from("# Managed by orca (nut plugin). Do not edit by hand.\n");
+        let mut out = String::from(MANAGED_HEADER);
         for m in &self.monitors {
             out.push_str(&format!(
                 "MONITOR {} {} {} {} {}\n",
-                m.system, m.power_value, m.username, m.password, m.role
+                m.system,
+                m.power_value,
+                quote_token(&m.username),
+                quote_token(&m.password),
+                m.role
             ));
         }
         out.push_str(&format!("MINSUPPLIES {}\n", s.min_supplies));
         out.push_str(&format!("SHUTDOWNCMD \"{}\"\n", s.shutdown_cmd));
-        out.push_str(&format!("POWERDOWNFLAG {}\n", s.power_down_flag));
+        // read_upsmon derives kill_power from POWERDOWNFLAG's presence.
+        if s.kill_power {
+            out.push_str(&format!("POWERDOWNFLAG {}\n", s.power_down_flag));
+        }
         out.push_str(&format!("HOSTSYNC {}\n", s.host_sync));
         out.push_str(&format!("DEADTIME {}\n", s.dead_time));
         // Route every event through upssched so logging + capture run.
         out.push_str(&format!("NOTIFYCMD {}\n", n.notify_cmd));
-        for flag in [
-            "ONLINE", "ONBATT", "LOWBATT", "COMMBAD", "COMMOK", "SHUTDOWN",
-        ] {
+        for flag in MANAGED_EVENTS {
             out.push_str(&format!("NOTIFYFLAG {flag} SYSLOG+WALL+EXEC\n"));
+        }
+        for line in &self.upsmon_extra {
+            out.push_str(&format!("{line}\n"));
         }
         out
     }
 
     fn render_upssched_conf(&self) -> String {
+        if let Some(custom) = &self.upssched_custom {
+            return custom.clone();
+        }
         let n = &self.notify;
-        let mut out = String::from("# Managed by orca (nut plugin). Do not edit by hand.\n");
+        let mut out = String::from(MANAGED_HEADER);
         out.push_str(&format!("CMDSCRIPT {}\n", n.notify_cmd));
         out.push_str(&format!("PIPEFN {}\n", n.pipe));
         out.push_str(&format!("LOCKFN {}\n", n.lock));
         // Persistent-event-log: every event logs to flash + remote immediately.
-        for event in [
-            "ONLINE", "ONBATT", "LOWBATT", "COMMBAD", "COMMOK", "SHUTDOWN",
-        ] {
+        for event in MANAGED_EVENTS {
             out.push_str(&format!(
                 "AT {event} * EXECUTE log-{}\n",
                 event.to_lowercase()
@@ -493,10 +592,14 @@ fn unraid_gui_mode(root: &Path) -> Option<String> {
         let Ok(text) = std::fs::read_to_string(root.join(cfg)) else {
             continue;
         };
-        let manual = text.lines().find_map(|l| {
-            let (k, v) = l.split_once('=')?;
-            (k.trim() == "MANUAL").then(|| v.trim().trim_matches('"').to_string())
-        });
+        // The cfg is sourced by bash, so the last assignment wins.
+        let manual = text
+            .lines()
+            .filter_map(|l| {
+                let (k, v) = l.split_once('=')?;
+                (k.trim() == "MANUAL").then(|| v.trim().trim_matches('"').to_string())
+            })
+            .next_back();
         match manual {
             Some(m) if m == "enable" => found = true,
             Some(m) => return Some(format!("MANUAL={m} in /{cfg}")),
@@ -760,14 +863,65 @@ fn sweep_stale_temps(dir: &Path, files: &[RenderedFile]) {
     }
 }
 
-/// `[name]` sections of `ups.conf`; directives before the first section are
-/// not modelled and are dropped.
+/// `line` with any `#` comment outside double quotes removed.
+fn strip_comment(line: &str) -> &str {
+    let (mut quoted, mut escaped) = (false, false);
+    for (i, c) in line.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' => escaped = true,
+            '"' => quoted = !quoted,
+            '#' if !quoted => return &line[..i],
+            _ => {}
+        }
+    }
+    line
+}
+
+/// NUT-style tokens: whitespace-separated, `"..."` groups, `\` escapes, `#` comments.
+fn tokenize(line: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut cur: Option<String> = None;
+    let (mut quoted, mut chars) = (false, line.chars());
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                if let Some(n) = chars.next() {
+                    cur.get_or_insert_with(String::new).push(n);
+                }
+            }
+            '"' => {
+                quoted = !quoted;
+                cur.get_or_insert_with(String::new);
+            }
+            '#' if !quoted => break,
+            c if c.is_whitespace() && !quoted => tokens.extend(cur.take()),
+            c => cur.get_or_insert_with(String::new).push(c),
+        }
+    }
+    tokens.extend(cur);
+    tokens
+}
+
+/// `s` quoted and escaped if [`tokenize`] would otherwise split or mangle it.
+fn quote_token(s: &str) -> String {
+    if !s.is_empty() && !s.contains(|c: char| c.is_whitespace() || matches!(c, '"' | '#' | '\\')) {
+        return s.to_string();
+    }
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Non-comment lines of `text`, comment-stripped and trimmed.
+fn content_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.lines()
+        .map(|l| strip_comment(l).trim())
+        .filter(|l| !l.is_empty())
+}
+
+/// `[name]` sections of `ups.conf`; global directives are in [`parse_ups_globals`].
 fn parse_ups_conf(text: &str) -> Vec<UpsDef> {
     let mut upses: Vec<UpsDef> = Vec::new();
-    for line in text.lines().map(str::trim) {
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
+    for line in content_lines(text) {
         if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
             upses.push(UpsDef {
                 name: name.trim().to_string(),
@@ -790,34 +944,68 @@ fn parse_ups_conf(text: &str) -> Vec<UpsDef> {
     upses
 }
 
+fn parse_ups_globals(text: &str) -> Vec<String> {
+    content_lines(text)
+        .take_while(|l| !l.starts_with('['))
+        .map(str::to_string)
+        .collect()
+}
+
 fn parse_upsd_conf(text: &str) -> Vec<ListenDef> {
     text.lines()
         .filter_map(|l| {
-            let mut f = l.split_whitespace();
-            (f.next()? == "LISTEN").then_some(())?;
+            let f = tokenize(l);
+            (f.first()? == "LISTEN").then_some(())?;
             Some(ListenDef {
-                address: f.next()?.to_string(),
-                port: f.next().and_then(|p| p.parse().ok()),
+                address: f.get(1)?.clone(),
+                port: f.get(2).and_then(|p| p.parse().ok()),
             })
         })
+        .collect()
+}
+
+fn parse_upsd_extra(text: &str) -> Vec<String> {
+    content_lines(text)
+        .filter(|l| tokenize(l).first().map(String::as_str) != Some("LISTEN"))
+        .map(str::to_string)
         .collect()
 }
 
 fn parse_monitors(text: &str) -> Vec<MonitorDef> {
     text.lines()
         .filter_map(|l| {
-            let f: Vec<&str> = l.split_whitespace().collect();
+            let f = tokenize(l);
             if f.len() != 6 || f[0] != "MONITOR" {
                 return None;
             }
             Some(MonitorDef {
-                system: f[1].to_string(),
+                system: f[1].clone(),
                 power_value: f[2].parse().unwrap_or(1),
-                username: f[3].to_string(),
-                password: f[4].to_string(),
-                role: f[5].to_string(),
+                username: f[3].clone(),
+                password: f[4].clone(),
+                role: f[5].clone(),
             })
         })
+        .collect()
+}
+
+/// `upsmon.conf` lines [`NutConfig::render_upsmon_conf`] does not itself emit.
+fn parse_upsmon_extra(text: &str) -> Vec<String> {
+    content_lines(text)
+        .filter(|l| {
+            let f = tokenize(l);
+            match f.first().map(String::as_str) {
+                Some(
+                    "MONITOR" | "MINSUPPLIES" | "SHUTDOWNCMD" | "POWERDOWNFLAG" | "HOSTSYNC"
+                    | "DEADTIME" | "NOTIFYCMD",
+                ) => false,
+                Some("NOTIFYFLAG") => !f
+                    .get(1)
+                    .is_some_and(|e| MANAGED_EVENTS.contains(&e.as_str())),
+                _ => true,
+            }
+        })
+        .map(str::to_string)
         .collect()
 }
 
@@ -856,8 +1044,14 @@ mod tests {
             }],
             upsmon: UpsmonSettings::default(),
             notify: NotifySettings::default(),
-            remove_upses: vec![],
+            ..Default::default()
         }
+    }
+
+    fn remote_monitors() -> Vec<MonitorDef> {
+        let mut m = sample().monitors;
+        m[0].system = "serverups@10.0.0.2".into();
+        m
     }
 
     #[test]
@@ -1017,7 +1211,7 @@ mod tests {
     fn monitor_only_config_restarts_client_only() {
         let (dir, group) = setup();
         let cfg = NutConfig {
-            monitors: sample().monitors,
+            monitors: remote_monitors(),
             ..Default::default()
         };
         let svc = MockServices::default();
@@ -1255,7 +1449,7 @@ mod tests {
         let before = std::fs::read_to_string(dir.path().join("ups.conf")).unwrap();
         let svc = MockServices::default();
         let client = NutConfig {
-            monitors: sample().monitors,
+            monitors: remote_monitors(),
             ..Default::default()
         };
         let err = client.apply_with(dir.path(), &svc, &group).unwrap_err();
@@ -1307,5 +1501,138 @@ mod tests {
         let (svc, log) = fake_services(root.path(), &[]);
         assert!(matches!(svc.restart(true), Restart::Unavailable(_)));
         assert!(log.borrow().is_empty());
+    }
+
+    const FULL_UPS: &str = "maxretry = 3\npollinterval = 2 # fast\nuser = nut\n\n\
+[serverups] # rack\n  driver = usbhid-ups\n  port = auto\n  desc = \"Rack UPS\"\n  \
+ignorelb\n  nolock\n  override.battery.charge.low = 30\n\n[other]\n  driver = snmp-ups\n  \
+port = 10.0.0.5\n  pollonly\n";
+    const FULL_UPSD: &str = "LISTEN 0.0.0.0 3493\nMAXAGE 25\nCERTFILE /etc/nut/cert.pem\n";
+    const FULL_UPSMON: &str = "RUN_AS_USER root\n\
+MONITOR serverups@localhost 1 monuser \"pass with spaces\" master # local\n\
+MONITOR other@127.0.0.1 1 monuser secret master\nMINSUPPLIES 1\n\
+SHUTDOWNCMD \"/sbin/shutdown -h +0\"\nPOWERDOWNFLAG /etc/killpower\nPOLLFREQ 5\n\
+FINALDELAY 5\nNOTIFYMSG ONBATT \"on battery\"\nNOTIFYFLAG LOWBATT SYSLOG\n\
+NOTIFYFLAG REPLBATT SYSLOG+WALL\n";
+    const FULL_UPSSCHED: &str = "CMDSCRIPT /usr/bin/custom\nAT ONBATT * START-TIMER x 30\n";
+
+    fn write_full(dir: &Path) {
+        for (n, t) in [
+            ("ups.conf", FULL_UPS),
+            ("upsd.conf", FULL_UPSD),
+            ("upsmon.conf", FULL_UPSMON),
+            ("upssched.conf", FULL_UPSSCHED),
+        ] {
+            std::fs::write(dir.join(n), t).unwrap();
+        }
+    }
+
+    #[test]
+    fn full_config_round_trips_without_loss() {
+        let (dir, group) = setup();
+        write_full(dir.path());
+        let before = NutConfig::read_existing(dir.path());
+        assert_eq!(before.upses.len(), 2);
+        assert_eq!(before.monitors.len(), 2);
+        assert_eq!(before.monitors[0].password, "pass with spaces");
+        assert!(before.upses[0]
+            .extra
+            .contains(&("ignorelb".into(), String::new())));
+        let svc = MockServices::default();
+        before.apply_with(dir.path(), &svc, &group).unwrap();
+        let after = NutConfig::read_existing(dir.path());
+        assert_eq!(after, before);
+        for line in [
+            "maxretry = 3",
+            "pollinterval = 2",
+            "user = nut",
+            "    ignorelb\n",
+            "    pollonly\n",
+        ] {
+            let ups = std::fs::read_to_string(dir.path().join("ups.conf")).unwrap();
+            assert!(ups.contains(line), "{line}\n{ups}");
+        }
+        let upsd = std::fs::read_to_string(dir.path().join("upsd.conf")).unwrap();
+        assert!(upsd.contains("MAXAGE 25") && upsd.contains("CERTFILE /etc/nut/cert.pem"));
+        let upsmon = std::fs::read_to_string(dir.path().join("upsmon.conf")).unwrap();
+        for line in [
+            "RUN_AS_USER root",
+            "POLLFREQ 5",
+            "FINALDELAY 5",
+            "NOTIFYMSG ONBATT \"on battery\"",
+            "NOTIFYFLAG REPLBATT SYSLOG+WALL",
+            "\"pass with spaces\"",
+        ] {
+            assert!(upsmon.contains(line), "{line}\n{upsmon}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("upssched.conf")).unwrap(),
+            FULL_UPSSCHED
+        );
+        let again = after.apply_with(dir.path(), &svc, &group).unwrap();
+        assert_eq!(again, ApplyOutcome::default(), "second apply is a no-op");
+        assert_eq!(*svc.calls.borrow(), vec![true]);
+    }
+
+    #[test]
+    fn unparsed_monitor_or_section_is_refused() {
+        let (dir, group) = setup();
+        write_full(dir.path());
+        let mut cfg = NutConfig::read_existing(dir.path());
+        cfg.monitors.pop();
+        let err = cfg
+            .apply_with(dir.path(), &MockServices::default(), &group)
+            .unwrap_err();
+        assert!(err.contains("MONITOR"), "{err}");
+
+        std::fs::write(dir.path().join("ups.conf"), format!("{FULL_UPS}[broken\n")).unwrap();
+        let err = NutConfig::read_existing(dir.path())
+            .apply_with(dir.path(), &MockServices::default(), &group)
+            .unwrap_err();
+        assert!(err.contains("[section]"), "{err}");
+    }
+
+    #[test]
+    fn local_monitor_without_ups_is_refused() {
+        let (dir, group) = setup();
+        let cfg = NutConfig {
+            upses: vec![],
+            ..sample()
+        };
+        let err = cfg
+            .apply_with(dir.path(), &MockServices::default(), &group)
+            .unwrap_err();
+        assert!(err.contains("serverups"), "{err}");
+    }
+
+    #[test]
+    fn unknown_remove_ups_is_refused() {
+        let (dir, group) = setup();
+        let cfg = NutConfig {
+            remove_upses: vec!["ghost".into()],
+            ..sample()
+        };
+        let err = cfg
+            .apply_with(dir.path(), &MockServices::default(), &group)
+            .unwrap_err();
+        assert!(err.contains("ghost"), "{err}");
+    }
+
+    #[test]
+    fn kill_power_false_omits_powerdownflag() {
+        let mut cfg = sample();
+        cfg.upsmon.kill_power = false;
+        assert!(!cfg.render_upsmon_conf().contains("POWERDOWNFLAG"));
+    }
+
+    #[test]
+    fn unraid_uses_last_manual_assignment() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = root.path().join("boot/config/plugins/nut/nut.cfg");
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        std::fs::write(&cfg, "MANUAL=\"enable\"\nMANUAL=\"disable\"\n").unwrap();
+        assert!(unraid_gui_mode(root.path()).is_some());
+        std::fs::write(&cfg, "MANUAL=\"disable\"\nMANUAL=\"enable\"\n").unwrap();
+        assert!(unraid_gui_mode(root.path()).is_none());
     }
 }

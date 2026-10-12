@@ -413,6 +413,16 @@ fn repair_write_config(what: &str) -> (bool, String) {
     // Merge the desired safe settings onto whatever is already configured so we
     // don't clobber an operator's UPS/monitor topology.
     let cfg = merged_safe_config(&dir);
+    if cfg.monitors.is_empty() {
+        return (
+            false,
+            format!(
+                "cannot apply {what}: {} has no MONITOR lines; run service.configure nut to \
+                 define monitors first",
+                dir.display()
+            ),
+        );
+    }
     match cfg.apply(&dir) {
         Ok(out) if out.written.is_empty() => (
             true,
@@ -480,7 +490,8 @@ fn repair_apcupsd_migrate() -> (bool, String) {
     (
         true,
         format!(
-            "{}; now deploy NUT with service.deploy nut and apply config via service.configure nut",
+            "{}; now deploy NUT with service.deploy nut, then run service.configure nut to define \
+             monitors first — the config repairs refuse to apply without them",
             steps.join(", ")
         ),
     )
@@ -493,7 +504,8 @@ fn repair_apcupsd_migrate() -> (bool, String) {
 /// operator's UPS/monitor setup while still enforcing the safe values.
 fn merged_safe_config(dir: &Path) -> NutConfig {
     let mut cfg = NutConfig::read_existing(dir);
-    // Enforce the safe kill-power + notify defaults regardless of prior state.
+    // Intentional: the safe-config repairs always enforce kill-power; turning it
+    // off is a deliberate ups config_set, not a repair.
     cfg.upsmon.kill_power = true;
     if cfg.upsmon.min_supplies == 0 {
         cfg.upsmon.min_supplies = 1;
