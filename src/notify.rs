@@ -621,7 +621,18 @@ mod tests {
             .parse()
             .unwrap();
         let start = Instant::now();
-        while unsafe { libc::kill(pid, 0) } == 0 {
+        // A killed grandchild stays a zombie where nothing reaps orphans
+        // (CI containers without an init), and kill(pid, 0) still succeeds on it.
+        let zombie = |pid: libc::pid_t| {
+            fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|s| {
+                    s.rsplit_once(')')
+                        .map(|(_, rest)| rest.trim_start().starts_with('Z'))
+                })
+                .unwrap_or(false)
+        };
+        while unsafe { libc::kill(pid, 0) } == 0 && !zombie(pid) {
             assert!(
                 start.elapsed() < Duration::from_secs(3),
                 "grandchild {pid} survived"
