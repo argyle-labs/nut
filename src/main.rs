@@ -18,6 +18,7 @@ fn main() -> plugin_toolkit::anyhow::Result<()> {
         nut::notify::run();
         std::process::exit(0);
     }
+    nut::notify::ensure_installed_at_startup();
     Plugin::named(nut::PROVIDER)
         .version(env!("CARGO_PKG_VERSION"))
         .service(nut::NutBackend::new(nut::PROVIDER))

@@ -1,8 +1,8 @@
 //! `orca-nut-notify` — the NUT event handler `upsmon` invokes as its
 //! `NOTIFYCMD`.
 //!
-//! It is the plugin binary itself, reached through a symlink named
-//! [`HANDLER_NAME`]; `main` dispatches here when `argv[0]` carries that name.
+//! It is the plugin binary itself, reached through a symlink (a copy on Unraid)
+//! named [`HANDLER_NAME`]; `main` dispatches here when `argv[0]` carries that name.
 //! It reads the `# orca-*` markers in `upssched.conf`, appends the event to
 //! `log_path`, forwards it to the remote syslog target, and on `ONBATT` runs the
 //! capture command. Every step is bounded and failures are swallowed: the
@@ -17,14 +17,20 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::config::{detect_conf_dir, marker_raw, marker_value, MANAGED_EVENTS};
+use crate::config::{
+    detect_conf_dir, detect_init, marker_raw, marker_value, InitSystem, MANAGED_EVENTS,
+};
 
 /// File name of the handler symlink; `main` dispatches on it.
 pub const HANDLER_NAME: &str = "orca-nut-notify";
 
-/// Directories the handler symlink may be installed into. Unraid uses the same
-/// `/usr/local/bin` (RAM-backed there; the `notify-handler` repair re-creates it).
+/// Directories the handler may be installed into.
 const HANDLER_DIRS: [&str; 2] = ["/usr/local/bin", "/usr/local/sbin"];
+
+/// Unraid's flash copy of the handler. `/usr/local/bin` is RAM there and the
+/// plugin binary sits on the array (mounted after NUT starts), so the handler is
+/// a real copy, restored at boot from this file by orca's `.plg`.
+const UNRAID_PERSIST: &str = "/boot/config/plugins/orca/orca-nut-notify";
 
 const LOG_TIMEOUT: Duration = Duration::from_secs(3);
 const SYSLOG_TIMEOUT: Duration = Duration::from_secs(3);
@@ -147,6 +153,7 @@ pub fn handle(event: &Event, targets: &Targets) -> Outcome {
     if let Some(target) = &targets.remote_syslog {
         out.syslog = Some(send_syslog(target, &line, SYSLOG_TIMEOUT));
     }
+    // Capture runs last: it can take up to CAPTURE_TIMEOUT and must not delay the log/syslog record.
     if event.wants_capture() {
         if let Some(cmd) = &targets.capture_cmd {
             out.capture = Some(run_capture(cmd, CAPTURE_TIMEOUT));
@@ -252,15 +259,21 @@ pub fn is_executable(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Point `path` at `exe` with a symlink, atomically. `Ok(false)` = already in place.
-pub fn install_handler(path: &Path, exe: &Path) -> Result<bool, String> {
+/// Install the handler at `path`: a symlink to `exe`, or with `persist` set a
+/// 0755 copy of `exe` plus a refreshed copy at `persist`. `Ok(false)` = already in place.
+pub fn install_handler(path: &Path, exe: &Path, persist: Option<&Path>) -> Result<bool, String> {
     let dirs: Vec<&Path> = HANDLER_DIRS.iter().map(Path::new).collect();
-    install_handler_in(path, exe, &dirs)
+    install_handler_in(path, exe, &dirs, persist)
 }
 
-/// [`install_handler`] restricted to `allowed` parent directories. Only an
-/// existing symlink is ever replaced, and the parent must already exist.
-fn install_handler_in(path: &Path, exe: &Path, allowed: &[&Path]) -> Result<bool, String> {
+/// [`install_handler`] restricted to `allowed` parent directories; the parent
+/// must already exist. Only a symlink, or a regular file we own, is replaced.
+fn install_handler_in(
+    path: &Path,
+    exe: &Path,
+    allowed: &[&Path],
+    persist: Option<&Path>,
+) -> Result<bool, String> {
     let shown = path.display();
     if !path.is_absolute() || path.components().any(|c| c == Component::ParentDir) {
         return Err(format!(
@@ -277,6 +290,14 @@ fn install_handler_in(path: &Path, exe: &Path, allowed: &[&Path]) -> Result<bool
     if !parent.is_dir() {
         return Err(format!("{}: directory does not exist", parent.display()));
     }
+    match persist {
+        None => install_symlink(path, parent, exe),
+        Some(persist) => install_copy(path, parent, exe, persist),
+    }
+}
+
+fn install_symlink(path: &Path, parent: &Path, exe: &Path) -> Result<bool, String> {
+    let shown = path.display();
     match fs::symlink_metadata(path) {
         Ok(m) if !m.file_type().is_symlink() => {
             return Err(format!(
@@ -296,6 +317,64 @@ fn install_handler_in(path: &Path, exe: &Path, allowed: &[&Path]) -> Result<bool
         format!("install {shown}: {e}")
     })?;
     Ok(true)
+}
+
+fn install_copy(path: &Path, parent: &Path, exe: &Path, persist: &Path) -> Result<bool, String> {
+    let shown = path.display();
+    let want = fs::read(exe).map_err(|e| format!("read {}: {e}", exe.display()))?;
+    let prior = fs::read(persist).ok();
+    let mut changed = false;
+    // Ownership: a regular file is ours iff its bytes equal the current binary or
+    // the flash copy we wrote before (checked before that copy is refreshed).
+    let current = match fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => None,
+        Ok(m) if m.is_file() => {
+            let have = fs::read(path).map_err(|e| format!("read {shown}: {e}"))?;
+            if have != want && prior.as_ref() != Some(&have) {
+                return Err(format!(
+                    "{shown} exists and is not orca's handler; refusing to replace it"
+                ));
+            }
+            Some(have)
+        }
+        Ok(_) => {
+            return Err(format!(
+                "{shown} exists and is not a file; refusing to replace it"
+            ))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("stat {shown}: {e}")),
+    };
+    if prior.as_ref() != Some(&want) {
+        let dir = persist
+            .parent()
+            .ok_or_else(|| format!("{}: no parent directory", persist.display()))?;
+        fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        write_atomic(persist, dir, &want)?;
+        changed = true;
+    }
+    if current.as_ref() != Some(&want) || !is_executable(path) {
+        write_atomic(path, parent, &want)?;
+        changed = true;
+    }
+    Ok(changed)
+}
+
+/// Write `bytes` to a fresh 0755 temp file in `dir`, then rename it over `path`.
+fn write_atomic(path: &Path, dir: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = dir.join(format!(".{HANDLER_NAME}.{}.tmp", random_suffix()?));
+    let res = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o755)
+        .open(&tmp)
+        .and_then(|mut f| f.write_all(bytes).and_then(|_| f.sync_all()))
+        .and_then(|_| fs::rename(&tmp, path));
+    res.map_err(|e| {
+        fs::remove_file(&tmp).ok();
+        format!("install {}: {e}", path.display())
+    })
 }
 
 fn random_suffix() -> Result<String, String> {
@@ -323,7 +402,23 @@ pub fn ensure_installed(notify_cmd: &str) -> Result<Option<bool>, String> {
     if !invoked_as_handler(notify_cmd) {
         return Ok(None);
     }
-    install_handler(Path::new(notify_cmd), &plugin_exe()?).map(Some)
+    let unraid = detect_init(Path::new("/")) == InitSystem::Unraid;
+    let persist = unraid.then_some(Path::new(UNRAID_PERSIST));
+    install_handler(Path::new(notify_cmd), &plugin_exe()?, persist).map(Some)
+}
+
+/// Startup safety net: re-install the handler the on-disk `upsmon.conf`
+/// `NOTIFYCMD` names. Never fails; a problem is only reported on stderr.
+pub fn ensure_installed_at_startup() {
+    let Ok(upsmon) = fs::read_to_string(detect_conf_dir().join("upsmon.conf")) else {
+        return;
+    };
+    let Some(cmd) = crate::checks::notify_cmd(&upsmon) else {
+        return;
+    };
+    if let Err(e) = ensure_installed(&cmd) {
+        eprintln!("warning: nut notify handler not installed: {e}");
+    }
 }
 
 #[cfg(test)]
@@ -499,8 +594,8 @@ mod tests {
         fs::create_dir(&bin).unwrap();
         let link = bin.join("orca-nut-notify");
         assert!(!is_executable(&link));
-        assert_eq!(install_handler_in(&link, &exe, &[&bin]), Ok(true));
-        assert_eq!(install_handler_in(&link, &exe, &[&bin]), Ok(false));
+        assert_eq!(install_handler_in(&link, &exe, &[&bin], None), Ok(true));
+        assert_eq!(install_handler_in(&link, &exe, &[&bin], None), Ok(false));
         assert!(is_executable(&link));
         assert_eq!(fs::read_link(&link).unwrap(), exe);
         let names: Vec<_> = fs::read_dir(&bin)
@@ -516,7 +611,7 @@ mod tests {
         let exe = exe_in(dir.path());
         let link = dir.path().join("orca-nut-notify");
         fs::write(&link, "operator script").unwrap();
-        assert!(install_handler_in(&link, &exe, &[dir.path()]).is_err());
+        assert!(install_handler_in(&link, &exe, &[dir.path()], None).is_err());
         assert_eq!(fs::read_to_string(&link).unwrap(), "operator script");
     }
 
@@ -526,14 +621,18 @@ mod tests {
         let exe = exe_in(dir.path());
         let other = dir.path().join("elsewhere");
         fs::create_dir(&other).unwrap();
-        let err = install_handler_in(&other.join("orca-nut-notify"), &exe, &[dir.path()]);
+        let err = install_handler_in(&other.join("orca-nut-notify"), &exe, &[dir.path()], None);
         assert!(err.unwrap_err().contains("must live in"));
         assert!(!other.join("orca-nut-notify").exists());
         let dotted = dir.path().join("elsewhere/../orca-nut-notify");
-        assert!(install_handler_in(&dotted, &exe, &[dir.path()]).is_err());
-        assert!(install_handler_in(Path::new("orca-nut-notify"), &exe, &[dir.path()]).is_err());
+        assert!(install_handler_in(&dotted, &exe, &[dir.path()], None).is_err());
+        assert!(
+            install_handler_in(Path::new("orca-nut-notify"), &exe, &[dir.path()], None).is_err()
+        );
         let missing = dir.path().join("missing");
-        assert!(install_handler_in(&missing.join("orca-nut-notify"), &exe, &[&missing]).is_err());
+        assert!(
+            install_handler_in(&missing.join("orca-nut-notify"), &exe, &[&missing], None).is_err()
+        );
         assert!(!missing.exists());
     }
 
@@ -544,5 +643,63 @@ mod tests {
         let cmd = dir.path().join("orca-nut-notify");
         assert!(ensure_installed(&cmd.display().to_string()).is_err());
         assert!(fs::symlink_metadata(&cmd).is_err());
+    }
+
+    #[test]
+    fn unraid_installs_a_persisted_copy_and_refreshes_on_upgrade() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let exe = exe_in(root.path());
+        let bin = root.path().join("usr/local/bin");
+        fs::create_dir_all(&bin).unwrap();
+        let path = bin.join(HANDLER_NAME);
+        let persist = root
+            .path()
+            .join("boot/config/plugins/orca")
+            .join(HANDLER_NAME);
+        assert_eq!(
+            install_handler_in(&path, &exe, &[&bin], Some(&persist)),
+            Ok(true)
+        );
+        assert!(!fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(fs::read(&persist).unwrap(), fs::read(&exe).unwrap());
+        assert_eq!(
+            install_handler_in(&path, &exe, &[&bin], Some(&persist)),
+            Ok(false)
+        );
+        fs::write(&exe, "#!/bin/sh\n# v2\n").unwrap();
+        assert_eq!(
+            install_handler_in(&path, &exe, &[&bin], Some(&persist)),
+            Ok(true)
+        );
+        assert_eq!(fs::read(&path).unwrap(), fs::read(&exe).unwrap());
+        assert_eq!(fs::read(&persist).unwrap(), fs::read(&exe).unwrap());
+        assert_eq!(fs::read_dir(&bin).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn unraid_copy_refuses_a_foreign_file_and_replaces_a_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let exe = exe_in(root.path());
+        let persist = root.path().join("flash").join(HANDLER_NAME);
+        let path = root.path().join(HANDLER_NAME);
+        fs::write(&path, "operator script").unwrap();
+        assert!(install_handler_in(&path, &exe, &[root.path()], Some(&persist)).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "operator script");
+        assert!(!persist.exists());
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&exe, &path).unwrap();
+        assert_eq!(
+            install_handler_in(&path, &exe, &[root.path()], Some(&persist)),
+            Ok(true)
+        );
+        assert!(fs::symlink_metadata(&path).unwrap().is_file());
     }
 }

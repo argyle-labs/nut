@@ -462,7 +462,7 @@ fn check_notify_handler(upsmon: &str, executable: fn(&Path) -> bool) -> Option<F
     ))
 }
 
-fn notify_cmd(upsmon: &str) -> Option<String> {
+pub(crate) fn notify_cmd(upsmon: &str) -> Option<String> {
     upsmon.lines().find_map(|l| match tokenize(l).as_slice() {
         [k, v] if k == "NOTIFYCMD" => Some(v.clone()),
         _ => None,
@@ -568,6 +568,12 @@ fn write_config(dir: &Path, what: &str, cfg: NutConfig) -> (bool, String) {
                  define monitors first",
                 dir.display()
             ),
+        );
+    }
+    if let Err(e) = crate::notify::ensure_installed(&cfg.notify.notify_cmd) {
+        return (
+            false,
+            format!("cannot apply {what}: notify handler not installed ({e}); nothing written"),
         );
     }
     match cfg.apply(dir) {
@@ -868,6 +874,26 @@ mod tests {
         assert!(!ok);
         assert!(msg.contains("failed to install"), "{msg}");
         assert!(fs::symlink_metadata(&cmd).is_err());
+    }
+
+    #[test]
+    fn write_config_refuses_when_handler_install_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = NutConfig {
+            monitors: vec![crate::config::MonitorDef {
+                system: "serverups@localhost".into(),
+                power_value: 1,
+                username: "u".into(),
+                password: "p".into(),
+                role: "master".into(),
+            }],
+            ..Default::default()
+        };
+        cfg.notify.notify_cmd = dir.path().join("orca-nut-notify").display().to_string();
+        let (ok, msg) = write_config(dir.path(), "x", cfg);
+        assert!(!ok);
+        assert!(msg.contains("notify handler not installed"), "{msg}");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[test]
