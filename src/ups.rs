@@ -68,16 +68,9 @@ pub fn config_get_typed(args: UpsQueryArgs) -> Vec<UpsConfig> {
     }]
 }
 
-/// `config_set` op — apply kill-power / SHUTDOWNCMD onto upsmon.conf idempotently
-/// (apply restarts the daemons itself, so `restart_required` is always false),
-/// merging onto whatever is already configured so an operator's UPS/monitor
-/// topology is preserved.
-pub fn config_set_typed(cfg: UpsConfig) -> UpsConfigOutcome {
-    let dir = detect_conf_dir();
-    let mut nut = NutConfig {
-        upsmon: crate::checks::read_upsmon(&dir).unwrap_or_default(),
-        ..Default::default()
-    };
+/// The on-disk config with `cfg`'s kill-power / SHUTDOWNCMD applied.
+fn merged_config(dir: &std::path::Path, cfg: &UpsConfig) -> NutConfig {
+    let mut nut = NutConfig::read_existing(dir);
     if let Some(k) = cfg.kill_power {
         nut.upsmon.kill_power = k;
     }
@@ -86,6 +79,15 @@ pub fn config_set_typed(cfg: UpsConfig) -> UpsConfigOutcome {
             nut.upsmon.shutdown_cmd = s.clone();
         }
     }
+    nut
+}
+
+/// `config_set` op — apply kill-power / SHUTDOWNCMD onto upsmon.conf idempotently,
+/// merging onto whatever is already configured so an operator's UPS/monitor
+/// topology is preserved.
+pub fn config_set_typed(cfg: UpsConfig) -> UpsConfigOutcome {
+    let dir = detect_conf_dir();
+    let nut = merged_config(&dir, &cfg);
     match nut.apply(&dir) {
         Ok(out) if out.written.is_empty() => UpsConfigOutcome {
             id: cfg.id,
@@ -128,6 +130,34 @@ mod tests {
         // No config dir → defaults; kill_power is always reported (Some).
         let cfgs = config_get_typed(UpsQueryArgs::default());
         assert!(cfgs.iter().any(|c| c.kill_power.is_some()));
+    }
+
+    #[test]
+    fn config_set_keeps_on_disk_topology() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("ups.conf"),
+            "[serverups]\n    driver = usbhid-ups\n    port = auto\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("upsd.conf"), "LISTEN 0.0.0.0 3493\n").unwrap();
+        std::fs::write(
+            dir.path().join("upsmon.conf"),
+            "MONITOR serverups@localhost 1 monuser secretref master\nSHUTDOWNCMD \"/sbin/halt\"\n",
+        )
+        .unwrap();
+        let nut = merged_config(
+            dir.path(),
+            &UpsConfig {
+                shutdown_cmd: Some("/sbin/shutdown -h +0".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(nut.upses.len(), 1);
+        assert_eq!(nut.upses[0].name, "serverups");
+        assert_eq!(nut.listen.len(), 1);
+        assert_eq!(nut.monitors.len(), 1);
+        assert_eq!(nut.upsmon.shutdown_cmd, "/sbin/shutdown -h +0");
     }
 
     #[test]

@@ -492,11 +492,7 @@ fn repair_apcupsd_migrate() -> (bool, String) {
 /// topology is already present, so the config-writing repairs don't discard an
 /// operator's UPS/monitor setup while still enforcing the safe values.
 fn merged_safe_config(dir: &Path) -> NutConfig {
-    let existing = read_upsmon(dir);
-    let mut cfg = NutConfig {
-        upsmon: existing.unwrap_or_default(),
-        ..Default::default()
-    };
+    let mut cfg = NutConfig::read_existing(dir);
     // Enforce the safe kill-power + notify defaults regardless of prior state.
     cfg.upsmon.kill_power = true;
     if cfg.upsmon.min_supplies == 0 {

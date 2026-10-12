@@ -38,6 +38,10 @@ pub struct NutConfig {
     /// `upssched`/`upsmon` notification + event-capture wiring.
     #[serde(default)]
     pub notify: NotifySettings,
+    /// UPS names on disk the caller intends to drop. Apply refuses to remove
+    /// any on-disk UPS not listed here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remove_upses: Vec<String>,
 }
 
 /// One UPS section in `ups.conf` (`[name]` + `driver`/`port`/…).
@@ -170,6 +174,19 @@ pub struct RenderedFile {
 }
 
 impl NutConfig {
+    /// The topology and settings currently on disk in `dir`; missing files
+    /// read as empty. `notify` is left at its default.
+    pub fn read_existing(dir: &Path) -> Self {
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap_or_default();
+        Self {
+            upses: parse_ups_conf(&read("ups.conf")),
+            listen: parse_upsd_conf(&read("upsd.conf")),
+            monitors: parse_monitors(&read("upsmon.conf")),
+            upsmon: crate::checks::read_upsmon(dir).unwrap_or_default(),
+            ..Default::default()
+        }
+    }
+
     /// Render all four config files deterministically.
     pub fn render(&self) -> Vec<RenderedFile> {
         vec![
@@ -210,6 +227,30 @@ impl NutConfig {
         services: &dyn ServiceControl,
         group_file: &Path,
     ) -> Result<ApplyOutcome, String> {
+        if self.monitors.is_empty() {
+            return Err(
+                "refusing to apply: config has no MONITOR lines, so upsmon would \
+                        protect nothing"
+                    .to_string(),
+            );
+        }
+        let on_disk =
+            parse_ups_conf(&std::fs::read_to_string(dir.join("ups.conf")).unwrap_or_default());
+        let dropped: Vec<&str> = on_disk
+            .iter()
+            .map(|u| u.name.as_str())
+            .filter(|n| !self.upses.iter().any(|u| u.name == *n))
+            .filter(|n| !self.remove_upses.iter().any(|r| r == n))
+            .collect();
+        if !dropped.is_empty() {
+            return Err(format!(
+                "refusing to apply: it would drop UPS {} from ups.conf; list them in \
+                 remove_upses to remove them",
+                dropped.join(", ")
+            ));
+        }
+        // Restart the server stack if this host drives UPS hardware before or after.
+        let server = !self.upses.is_empty() || !on_disk.is_empty();
         std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
         let rendered = self.render();
         sweep_stale_temps(dir, &rendered);
@@ -217,7 +258,8 @@ impl NutConfig {
         for file in &rendered {
             let path = dir.join(file.name);
             // Symlinked targets are refused: renaming over the link would
-            // silently detach it from whatever it pointed at.
+            // silently detach it from whatever it pointed at. Only the files
+            // are checked; a symlinked `dir` itself is followed.
             if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
                 return Err(format!(
                     "{} is a symlink; refusing to replace it",
@@ -263,11 +305,11 @@ impl NutConfig {
         }
 
         let written: Vec<String> = changed.iter().map(|(f, _, _)| f.name.to_string()).collect();
-        let mut notes = Vec::new();
+        let mut notes: Vec<String> = staged.iter().filter_map(|s| s.note.clone()).collect();
         if let Err(e) = std::fs::File::open(dir).and_then(|d| d.sync_all()) {
             notes.push(format!("fsync {}: {e}", dir.display()));
         }
-        let restart_required = match services.restart(!self.upses.is_empty()) {
+        let restart_required = match services.restart(server) {
             Restart::Done(units) => {
                 notes.push(format!("restarted {}", units.join(", ")));
                 false
@@ -434,26 +476,34 @@ pub fn detect_init(root: &Path) -> InitSystem {
     }
 }
 
-/// The Unraid NUT plugin's `MANUAL` setting when it is in GUI mode.
+/// Why `rc.nut restart` is unsafe here, or `None` when the Unraid NUT plugin
+/// is positively in manual config mode.
 ///
 /// `rc.nut restart` runs the plugin's `write_config`, which in GUI mode
 /// (`MANUAL="disable"`/`"onlyups"`) rewrites lines of `ups.conf`/`upsmon.conf`
 /// from the plugin's own settings, clobbering ours. Only `MANUAL="enable"`
-/// leaves `/etc/nut` alone (it then just copies it to flash).
+/// leaves `/etc/nut` alone (it then just copies it to flash), so every plugin
+/// cfg present must say so.
 fn unraid_gui_mode(root: &Path) -> Option<String> {
-    [
+    let mut found = false;
+    for cfg in [
         "boot/config/plugins/nut-dw/nut-dw.cfg",
         "boot/config/plugins/nut/nut.cfg",
-    ]
-    .iter()
-    .find_map(|cfg| std::fs::read_to_string(root.join(cfg)).ok())
-    .and_then(|cfg| {
-        cfg.lines().find_map(|l| {
-            let v = l.trim().strip_prefix("MANUAL=")?;
-            Some(v.trim_matches('"').to_string())
-        })
-    })
-    .filter(|m| m != "enable")
+    ] {
+        let Ok(text) = std::fs::read_to_string(root.join(cfg)) else {
+            continue;
+        };
+        let manual = text.lines().find_map(|l| {
+            let (k, v) = l.split_once('=')?;
+            (k.trim() == "MANUAL").then(|| v.trim().trim_matches('"').to_string())
+        });
+        match manual {
+            Some(m) if m == "enable" => found = true,
+            Some(m) => return Some(format!("MANUAL={m} in /{cfg}")),
+            None => {}
+        }
+    }
+    (!found).then(|| "no MANUAL=\"enable\" in the NUT plugin config".to_string())
 }
 
 type Runner = Box<dyn Fn(&str, &[&str]) -> Result<String, String>>;
@@ -481,21 +531,20 @@ impl SystemServices {
                 vec![(rc, vec!["restart".to_string()])]
             }
             InitSystem::Systemd => {
+                let present = |u: &&str| (self.run)("systemctl", &["cat", u]).is_ok();
                 let mut units = Vec::new();
                 if server {
                     // NUT >= 2.8 drives per-UPS nut-driver@ instances via the target.
-                    if let Some(d) = ["nut-driver.target", "nut-driver.service"]
-                        .into_iter()
-                        .find(|u| (self.run)("systemctl", &["cat", u]).is_ok())
-                    {
-                        units.push(d);
-                    }
-                    units.push("nut-server.service");
+                    units.extend(
+                        ["nut-driver.target", "nut-driver.service"]
+                            .into_iter()
+                            .find(present),
+                    );
+                    units.extend(["nut-server.service"].into_iter().filter(present));
                 }
-                units.push("nut-monitor.service");
+                units.extend(["nut-monitor.service"].into_iter().filter(present));
                 units
                     .into_iter()
-                    .filter(|u| (self.run)("systemctl", &["cat", u]).is_ok())
                     .map(|u| {
                         let args = vec!["restart".to_string(), u.to_string()];
                         ("systemctl".to_string(), args)
@@ -536,7 +585,7 @@ impl ServiceControl for SystemServices {
         if init == InitSystem::Unraid {
             if let Some(mode) = unraid_gui_mode(&self.root) {
                 return Restart::Unavailable(format!(
-                    "Unraid NUT plugin is in GUI mode (MANUAL={mode}); `rc.nut restart` would \
+                    "Unraid NUT plugin is not in manual config mode ({mode}); `rc.nut restart` would \
                      overwrite the new config. Switch the plugin to manual config mode, then run \
                      /etc/rc.d/rc.nut restart"
                 ));
@@ -544,9 +593,11 @@ impl ServiceControl for SystemServices {
         }
         let plan = self.plan(init, server);
         if plan.is_empty() {
-            return Restart::Unavailable(format!(
-                "no NUT service manager found ({init:?}); restart NUT to load the new config"
-            ));
+            return Restart::Unavailable(if init == InitSystem::None {
+                "no NUT service manager found; restart NUT to load the new config".to_string()
+            } else {
+                format!("no NUT units found ({init:?}); restart NUT to load the new config")
+            });
         }
         let mut done = Vec::new();
         let mut failed = Vec::new();
@@ -579,6 +630,8 @@ struct Staged {
     tmp: PathBuf,
     path: PathBuf,
     meta: Option<std::fs::Metadata>,
+    /// Non-fatal staging problem to surface to the operator.
+    note: Option<String>,
 }
 
 /// Write `contents` to a same-dir temp file with the target's final mode and
@@ -587,11 +640,12 @@ struct Staged {
 /// root:nut.
 fn stage(path: &Path, contents: &[u8], group_file: &Path) -> Result<Staged, String> {
     let meta = std::fs::metadata(path).ok();
-    let tmp = stage_with(path, contents, meta.as_ref(), group_file)?;
+    let (tmp, note) = stage_with(path, contents, meta.as_ref(), group_file, true)?;
     Ok(Staged {
         tmp,
         path: path.to_path_buf(),
         meta,
+        note,
     })
 }
 
@@ -600,7 +654,8 @@ fn stage_with(
     contents: &[u8],
     existing: Option<&std::fs::Metadata>,
     group_file: &Path,
-) -> Result<PathBuf, String> {
+    clamp: bool,
+) -> Result<(PathBuf, Option<String>), String> {
     let dir = path.parent().unwrap_or(Path::new("."));
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("conf");
     let (mut mode, uid, gid) = match existing {
@@ -616,7 +671,7 @@ fn stage_with(
             (0o640, 0, gid)
         }
     };
-    if name == "upsmon.conf" {
+    if clamp && name == "upsmon.conf" {
         mode &= 0o640;
     }
     let tmp = dir.join(format!(
@@ -625,6 +680,7 @@ fn stage_with(
         TMP_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     let result = (|| {
+        let mut note = None;
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -640,16 +696,25 @@ fn stage_with(
             let m = f
                 .metadata()
                 .map_err(|e| format!("stat {}: {e}", tmp.display()))?;
-            if existing.is_some() && (m.uid(), m.gid()) != (uid, gid) {
-                return Err(format!("chown {}: {e}", tmp.display()));
+            if (m.uid(), m.gid()) != (uid, gid) {
+                if existing.is_some() {
+                    return Err(format!("chown {}: {e}", tmp.display()));
+                }
+                note = Some(format!(
+                    "{} created as {}:{} (chown to {uid}:{gid} failed: {e})",
+                    path.display(),
+                    m.uid(),
+                    m.gid()
+                ));
             }
         }
         f.write_all(contents)
             .and_then(|_| f.sync_all())
-            .map_err(|e| format!("write {}: {e}", tmp.display()))
+            .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        Ok(note)
     })();
     match result {
-        Ok(()) => Ok(tmp),
+        Ok(note) => Ok((tmp, note)),
         Err(e) => {
             let _removed = std::fs::remove_file(&tmp);
             Err(e)
@@ -667,7 +732,7 @@ fn rollback(
 ) -> Result<(), String> {
     match old {
         Some(old) => {
-            let tmp = stage_with(path, old, meta.as_ref(), group_file)?;
+            let (tmp, _) = stage_with(path, old, meta.as_ref(), group_file, false)?;
             std::fs::rename(&tmp, path).map_err(|e| {
                 let _removed = std::fs::remove_file(&tmp);
                 e.to_string()
@@ -693,6 +758,67 @@ fn sweep_stale_temps(dir: &Path, files: &[RenderedFile]) {
             let _removed = std::fs::remove_file(entry.path());
         }
     }
+}
+
+/// `[name]` sections of `ups.conf`; directives before the first section are
+/// not modelled and are dropped.
+fn parse_ups_conf(text: &str) -> Vec<UpsDef> {
+    let mut upses: Vec<UpsDef> = Vec::new();
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            upses.push(UpsDef {
+                name: name.trim().to_string(),
+                ..Default::default()
+            });
+            continue;
+        }
+        let Some(ups) = upses.last_mut() else {
+            continue;
+        };
+        let (k, v) = line.split_once('=').unwrap_or((line, ""));
+        let (k, v) = (k.trim(), v.trim());
+        match k {
+            "driver" => ups.driver = v.to_string(),
+            "port" => ups.port = v.to_string(),
+            "desc" => ups.description = v.trim_matches('"').to_string(),
+            _ => ups.extra.push((k.to_string(), v.to_string())),
+        }
+    }
+    upses
+}
+
+fn parse_upsd_conf(text: &str) -> Vec<ListenDef> {
+    text.lines()
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            (f.next()? == "LISTEN").then_some(())?;
+            Some(ListenDef {
+                address: f.next()?.to_string(),
+                port: f.next().and_then(|p| p.parse().ok()),
+            })
+        })
+        .collect()
+}
+
+fn parse_monitors(text: &str) -> Vec<MonitorDef> {
+    text.lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            if f.len() != 6 || f[0] != "MONITOR" {
+                return None;
+            }
+            Some(MonitorDef {
+                system: f[1].to_string(),
+                power_value: f[2].parse().unwrap_or(1),
+                username: f[3].to_string(),
+                password: f[4].to_string(),
+                role: f[5].to_string(),
+            })
+        })
+        .collect()
 }
 
 /// gid of the `nut` group from `group_file`, if present.
@@ -730,6 +856,7 @@ mod tests {
             }],
             upsmon: UpsmonSettings::default(),
             notify: NotifySettings::default(),
+            remove_upses: vec![],
         }
     }
 
@@ -1041,7 +1168,7 @@ mod tests {
         touch(root.path(), "etc/init.d/nut-upsd");
         touch(root.path(), "etc/init.d/nut-upsmon");
         let (svc, log) = fake_services(root.path(), &[]);
-        svc.restart(true);
+        assert!(matches!(svc.restart(true), Restart::Done(_)));
         assert_eq!(
             *log.borrow(),
             vec![
@@ -1050,8 +1177,128 @@ mod tests {
             ]
         );
         log.borrow_mut().clear();
-        svc.restart(false);
+        assert!(matches!(svc.restart(false), Restart::Done(_)));
         assert_eq!(*log.borrow(), vec!["rc-service nut-upsmon restart"]);
+    }
+
+    #[test]
+    fn unraid_missing_manual_key_does_not_restart() {
+        let root = tempfile::tempdir().unwrap();
+        touch(root.path(), RC_NUT);
+        touch(root.path(), "boot/config/plugins/nut/nut.cfg");
+        std::fs::write(
+            root.path().join("boot/config/plugins/nut/nut.cfg"),
+            "MODE=\"netserver\"\n",
+        )
+        .unwrap();
+        let (svc, log) = fake_services(root.path(), &[]);
+        assert!(matches!(svc.restart(true), Restart::Unavailable(_)));
+        assert!(log.borrow().is_empty());
+    }
+
+    #[test]
+    fn unraid_checks_every_cfg_and_tolerates_spaces() {
+        let root = tempfile::tempdir().unwrap();
+        touch(root.path(), RC_NUT);
+        touch(root.path(), "boot/config/plugins/nut-dw/nut-dw.cfg");
+        touch(root.path(), "boot/config/plugins/nut/nut.cfg");
+        std::fs::write(
+            root.path().join("boot/config/plugins/nut-dw/nut-dw.cfg"),
+            "MANUAL = \"enable\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("boot/config/plugins/nut/nut.cfg"),
+            "MANUAL=\"disable\"\n",
+        )
+        .unwrap();
+        assert!(unraid_gui_mode(root.path()).is_some());
+        std::fs::write(
+            root.path().join("boot/config/plugins/nut/nut.cfg"),
+            "MANUAL =enable\n",
+        )
+        .unwrap();
+        assert_eq!(unraid_gui_mode(root.path()), None);
+    }
+
+    #[test]
+    fn systemd_without_units_says_no_units_found() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("run/systemd/system")).unwrap();
+        let (svc, _) = fake_services(root.path(), &[]);
+        match svc.restart(true) {
+            Restart::Unavailable(m) => assert!(m.contains("no NUT units found"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_without_monitors_is_refused() {
+        let (dir, group) = setup();
+        let svc = MockServices::default();
+        let cfg = NutConfig {
+            monitors: vec![],
+            ..sample()
+        };
+        let err = cfg.apply_with(dir.path(), &svc, &group).unwrap_err();
+        assert!(err.contains("MONITOR"), "{err}");
+        assert!(entries(dir.path()).is_empty());
+        assert!(svc.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn dropping_an_on_disk_ups_is_refused_unless_listed() {
+        let (dir, group) = setup();
+        sample()
+            .apply_with(dir.path(), &MockServices::default(), &group)
+            .unwrap();
+        let before = std::fs::read_to_string(dir.path().join("ups.conf")).unwrap();
+        let svc = MockServices::default();
+        let client = NutConfig {
+            monitors: sample().monitors,
+            ..Default::default()
+        };
+        let err = client.apply_with(dir.path(), &svc, &group).unwrap_err();
+        assert!(err.contains("serverups"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("ups.conf")).unwrap(),
+            before
+        );
+        assert!(svc.calls.borrow().is_empty());
+
+        let client = NutConfig {
+            remove_upses: vec!["serverups".into()],
+            ..client
+        };
+        client.apply_with(dir.path(), &svc, &group).unwrap();
+        // The host drove UPS hardware before this apply, so the server stack restarts.
+        assert_eq!(*svc.calls.borrow(), vec![true]);
+    }
+
+    #[test]
+    fn read_existing_round_trips_topology() {
+        let (dir, group) = setup();
+        let mut cfg = sample();
+        cfg.upses[0].extra = vec![("pollinterval".into(), "5".into())];
+        cfg.apply_with(dir.path(), &MockServices::default(), &group)
+            .unwrap();
+        let read = NutConfig::read_existing(dir.path());
+        assert_eq!(read, cfg);
+    }
+
+    #[test]
+    fn rollback_restores_exact_original_mode() {
+        let (dir, group) = setup();
+        let mon = dir.path().join("upsmon.conf");
+        std::fs::write(&mon, "old").unwrap();
+        std::fs::set_permissions(&mon, std::fs::Permissions::from_mode(0o664)).unwrap();
+        std::fs::create_dir(dir.path().join("upssched.conf")).unwrap();
+        std::fs::write(dir.path().join("upssched.conf").join("x"), "").unwrap();
+        sample()
+            .apply_with(dir.path(), &MockServices::default(), &group)
+            .unwrap_err();
+        assert_eq!(std::fs::read_to_string(&mon).unwrap(), "old");
+        assert_eq!(std::fs::metadata(&mon).unwrap().mode() & 0o7777, 0o664);
     }
 
     #[test]
