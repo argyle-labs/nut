@@ -287,6 +287,8 @@ impl NutConfig {
         install: &dyn Fn(&str) -> Result<Option<bool>, String>,
         write: impl FnOnce(&Self) -> Result<ApplyOutcome, String>,
     ) -> Result<ApplyOutcome, String> {
+        self.check_values()
+            .map_err(|e| format!("refusing to apply: {e}"))?;
         install(&self.notify.notify_cmd).map_err(|e| {
             format!(
                 "notify handler not installed ({e}); nothing written in {}",
@@ -2169,6 +2171,21 @@ NOTIFYFLAG REPLBATT SYSLOG+WALL\n";
         cfg.upses[0].extra = vec![("# a note".into(), String::new())];
         cfg.notify_flags = vec![("ONBATT".into(), "WALL+EXEC".into())];
         assert!(cfg.check_values().is_ok());
+    }
+
+    #[test]
+    fn invalid_config_is_refused_before_install() {
+        let mut cfg = sample();
+        cfg.upses[0].name = "server ups".into();
+        let dir = tempfile::tempdir().unwrap();
+        let err = cfg
+            .apply_gated(
+                dir.path(),
+                &|_| panic!("installed despite invalid config"),
+                |_| panic!("wrote despite invalid config"),
+            )
+            .unwrap_err();
+        assert!(err.starts_with("refusing to apply"), "{err}");
     }
 
     #[test]

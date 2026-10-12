@@ -290,10 +290,33 @@ fn install_handler_in(
     if !parent.is_dir() {
         return Err(format!("{}: directory does not exist", parent.display()));
     }
+    let _lock = lock_dir(parent)?;
     match persist {
         None => install_symlink(path, parent, exe),
         Some(persist) => install_copy(path, parent, exe, persist),
     }
+}
+
+/// Exclusive `flock` serializing installs into `dir`, which share one temp name.
+/// Released when the returned file is dropped.
+fn lock_dir(dir: &Path) -> Result<fs::File, String> {
+    use std::os::unix::io::AsRawFd;
+    let path = dir.join(format!(".{HANDLER_NAME}.lock"));
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+    // SAFETY: `file` owns a valid open descriptor for the duration of the call.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(format!(
+            "lock {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(file)
 }
 
 fn install_symlink(path: &Path, parent: &Path, exe: &Path) -> Result<bool, String> {
@@ -317,7 +340,7 @@ fn install_symlink(path: &Path, parent: &Path, exe: &Path) -> Result<bool, Strin
         fs::remove_file(&tmp).ok();
         format!("install {shown}: {e}")
     })?;
-    sync_dir(parent)?;
+    sync_dir(parent);
     Ok(true)
 }
 
@@ -382,11 +405,12 @@ fn tmp_path(dir: &Path) -> PathBuf {
     dir.join(format!(".{HANDLER_NAME}.tmp"))
 }
 
-/// Persist a rename by fsyncing its directory.
-fn sync_dir(dir: &Path) -> Result<(), String> {
-    fs::File::open(dir)
-        .and_then(|d| d.sync_all())
-        .map_err(|e| format!("sync {}: {e}", dir.display()))
+/// Persist a rename by fsyncing its directory. The rename has already landed,
+/// so a failure is only reported.
+fn sync_dir(dir: &Path) {
+    if let Err(e) = fs::File::open(dir).and_then(|d| d.sync_all()) {
+        eprintln!("warning: sync {}: {e}", dir.display());
+    }
 }
 
 /// Write `bytes` to a fresh 0755 temp file in `dir`, then rename it over `path`.
@@ -406,7 +430,8 @@ fn write_atomic(path: &Path, dir: &Path, bytes: &[u8]) -> Result<(), String> {
         fs::remove_file(&tmp).ok();
         format!("install {}: {e}", path.display())
     })?;
-    sync_dir(dir)
+    sync_dir(dir);
+    Ok(())
 }
 
 /// The running binary, minus the " (deleted)" suffix Linux appends once it is
@@ -629,7 +654,7 @@ mod tests {
             .unwrap()
             .map(|e| e.unwrap().file_name())
             .collect();
-        assert_eq!(names.len(), 1, "no temp file left behind: {names:?}");
+        assert_eq!(names.len(), 2, "only handler and lock remain: {names:?}");
     }
 
     #[test]
@@ -640,6 +665,37 @@ mod tests {
         fs::write(&link, "operator script").unwrap();
         assert!(install_handler_in(&link, &exe, &[dir.path()], None).is_err());
         assert_eq!(fs::read_to_string(&link).unwrap(), "operator script");
+    }
+
+    #[test]
+    fn concurrent_installs_are_serialized() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = exe_in(dir.path());
+        let bin = dir.path().join("bin");
+        let flash = dir.path().join("flash");
+        fs::create_dir(&bin).unwrap();
+        let target = bin.join("orca-nut-notify");
+        let persist = flash.join("orca-nut-notify");
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (0..16)
+                .map(|i| {
+                    let (target, exe, bin, persist) = (&target, &exe, &bin, &persist);
+                    s.spawn(move || {
+                        let p = (i % 2 == 0).then_some(persist.as_path());
+                        install_handler_in(target, exe, &[bin.as_path()], p)
+                    })
+                })
+                .collect();
+            for h in handles {
+                let res = h.join().unwrap();
+                // A copy and a symlink each refuse to replace the other kind.
+                if let Err(e) = res {
+                    assert!(e.contains("refusing to replace"), "{e}");
+                }
+            }
+        });
+        assert_eq!(fs::read(&target).unwrap(), fs::read(&exe).unwrap());
+        assert!(!tmp_path(&bin).exists());
     }
 
     #[test]
@@ -708,7 +764,7 @@ mod tests {
         );
         assert_eq!(fs::read(&path).unwrap(), fs::read(&exe).unwrap());
         assert_eq!(fs::read(&persist).unwrap(), fs::read(&exe).unwrap());
-        assert_eq!(fs::read_dir(&bin).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(&bin).unwrap().count(), 2);
     }
 
     #[test]
@@ -774,6 +830,6 @@ mod tests {
             install_handler_in(&path, &exe, &[&bin], Some(&persist)),
             Ok(true)
         );
-        assert_eq!(fs::read_dir(&bin).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(&bin).unwrap().count(), 2);
     }
 }
