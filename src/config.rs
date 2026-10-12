@@ -152,12 +152,12 @@ impl Default for UpsmonSettings {
 
 /// Notification / event-capture wiring for `upsmon.conf` + `upssched.conf`.
 ///
-/// The survivable-logging path: on events `upsmon` calls `upssched`, whose
-/// command handler logs to flash (`log_path`) and forwards to a remote syslog
+/// The survivable-logging path: on events `upsmon` calls the handler
+/// (`NOTIFYCMD`), which logs to flash (`log_path`), forwards to a remote syslog
 /// target, and on `ONBATT` runs the diagnostics snapshot before shutdown.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NotifySettings {
-    /// Path `upssched` invokes as its command handler (`NOTIFYCMD`/`CMDSCRIPT`).
+    /// Handler path, written as `NOTIFYCMD` (and `CMDSCRIPT` in `upssched.conf`).
     pub notify_cmd: String,
     /// `upssched` command pipe/lock paths.
     pub pipe: String,
@@ -203,7 +203,7 @@ impl NotifySettings {
 
 const MANAGED_HEADER: &str = "# Managed by orca (nut plugin). Do not edit by hand.\n";
 
-const MANAGED_EVENTS: [&str; 6] = [
+pub(crate) const MANAGED_EVENTS: [&str; 6] = [
     "ONLINE", "ONBATT", "LOWBATT", "COMMBAD", "COMMOK", "SHUTDOWN",
 ];
 
@@ -685,7 +685,7 @@ impl NutConfig {
         }
         out.push_str(&format!("HOSTSYNC {}\n", s.host_sync));
         out.push_str(&format!("DEADTIME {}\n", s.dead_time));
-        // Route every event through upssched so logging + capture run.
+        // upsmon hands every managed event straight to the handler.
         out.push_str(&format!("NOTIFYCMD {}\n", quote_token(&n.notify_cmd)));
         for event in MANAGED_EVENTS {
             let mut flags = MANAGED_FLAGS.to_vec();

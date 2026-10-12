@@ -27,7 +27,7 @@ plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" 
 tokio = { version = "1", features = ["net", "io-util", "time", "rt"] }
 serde = { version = "1", features = ["derive"] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]

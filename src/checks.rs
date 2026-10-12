@@ -42,7 +42,7 @@ fn shutdown_cmd_unsafe(cmd: &str) -> bool {
 pub async fn diagnose_typed(_args: DiagnoseArgs) -> Vec<Finding> {
     let dir = detect_conf_dir();
     let mut findings: Vec<Finding> = Vec::new();
-    let upsmon = read_upsmon(&dir).unwrap_or_else(|e| {
+    let upsmon_parsed = read_upsmon_with_text(&dir).unwrap_or_else(|e| {
         findings.push(finding(
             "upsmon-conf",
             Severity::Crit,
@@ -52,6 +52,10 @@ pub async fn diagnose_typed(_args: DiagnoseArgs) -> Vec<Finding> {
         ));
         None
     });
+    let (upsmon, upsmon_text) = match upsmon_parsed {
+        Some((s, t)) => (Some(s), Some(t)),
+        None => (None, None),
+    };
     let mut read = |id: &str, name: &str| {
         read_or_empty(&dir.join(name)).unwrap_or_else(|e| {
             findings.push(finding(
@@ -95,9 +99,8 @@ pub async fn diagnose_typed(_args: DiagnoseArgs) -> Vec<Finding> {
         on_tmpfs,
     ));
     findings.extend(check_onbattery_capture(&upssched));
-    if upsmon.is_some() {
-        let upsmon_text = read_or_empty(&dir.join("upsmon.conf")).unwrap_or_default();
-        findings.extend(check_notify_handler(&upsmon_text, notify::is_executable));
+    if let Some(text) = &upsmon_text {
+        findings.extend(check_notify_handler(text, notify::is_executable));
     }
     findings
 }
@@ -738,6 +741,11 @@ fn statfs_tmpfs(_path: &Path) -> Option<bool> {
 /// file is absent (NUT not set up as a monitor here); `Err` when a modelled
 /// setting is present but does not parse, so callers never act on a default.
 pub(crate) fn read_upsmon(dir: &Path) -> Result<Option<UpsmonSettings>, String> {
+    Ok(read_upsmon_with_text(dir)?.map(|(s, _)| s))
+}
+
+/// [`read_upsmon`] plus the raw file text, for checks that read other keys.
+fn read_upsmon_with_text(dir: &Path) -> Result<Option<(UpsmonSettings, String)>, String> {
     let path = dir.join("upsmon.conf");
     let text = match fs::read_to_string(&path) {
         Ok(t) => t,
@@ -780,7 +788,7 @@ pub(crate) fn read_upsmon(dir: &Path) -> Result<Option<UpsmonSettings>, String> 
     }
     // kill_power is on only when a POWERDOWNFLAG is actually declared.
     s.kill_power = saw_flag;
-    Ok(Some(s))
+    Ok(Some((s, text)))
 }
 
 fn ups_comms_summary(upses: &[Ups]) -> String {
@@ -839,6 +847,28 @@ pub(crate) fn run(bin: &str, args: &[&str]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repair_notify_handler_outcomes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ok, msg) = repair_notify_handler(dir.path());
+        assert!(!ok);
+        assert!(msg.contains("no NOTIFYCMD"), "{msg}");
+        fs::write(dir.path().join("upsmon.conf"), "NOTIFYCMD /opt/mine.sh\n").unwrap();
+        let (ok, msg) = repair_notify_handler(dir.path());
+        assert!(!ok);
+        assert!(msg.contains("not orca's handler"), "{msg}");
+        let cmd = dir.path().join("orca-nut-notify");
+        fs::write(
+            dir.path().join("upsmon.conf"),
+            format!("NOTIFYCMD {}\n", cmd.display()),
+        )
+        .unwrap();
+        let (ok, msg) = repair_notify_handler(dir.path());
+        assert!(!ok);
+        assert!(msg.contains("failed to install"), "{msg}");
+        assert!(fs::symlink_metadata(&cmd).is_err());
+    }
 
     #[test]
     fn notify_handler_check() {
