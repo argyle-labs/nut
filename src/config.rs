@@ -157,7 +157,7 @@ impl Default for UpsmonSettings {
 /// target, and on `ONBATT` runs the diagnostics snapshot before shutdown.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NotifySettings {
-    /// Handler path, written as `NOTIFYCMD` (and `CMDSCRIPT` in `upssched.conf`).
+    /// Handler path, written as `NOTIFYCMD` in `upsmon.conf`.
     pub notify_cmd: String,
     /// `upssched` command pipe/lock paths.
     pub pipe: String,
@@ -736,18 +736,10 @@ impl NutConfig {
         }
         let n = &self.notify;
         let mut out = String::from(MANAGED_HEADER);
-        out.push_str(&format!("CMDSCRIPT {}\n", quote_token(&n.notify_cmd)));
+        // upsmon's NOTIFYCMD runs the handler directly (ONBATT triggers the
+        // capture there), so upssched gets no CMDSCRIPT/AT routing.
         out.push_str(&format!("PIPEFN {}\n", quote_token(&n.pipe)));
         out.push_str(&format!("LOCKFN {}\n", quote_token(&n.lock)));
-        // Persistent-event-log: every event logs to flash + remote immediately.
-        for event in MANAGED_EVENTS {
-            out.push_str(&format!(
-                "AT {event} * EXECUTE log-{}\n",
-                event.to_lowercase()
-            ));
-        }
-        // On-battery diagnostics capture runs before shutdown proceeds.
-        out.push_str("AT ONBATT * EXECUTE onbattery-capture\n");
         // Persist the log target + remote + capture command as comments the
         // command handler reads (single source of truth for the handler).
         out.push_str(&format!("# orca-log-path {}\n", quote_token(&n.log_path)));
@@ -2196,6 +2188,16 @@ NOTIFYFLAG REPLBATT SYSLOG+WALL\n";
             let err = cfg.check_values().unwrap_err();
             assert!(err.contains("onbattery capture"), "{err}");
         }
+    }
+
+    #[test]
+    fn managed_upssched_has_no_dead_routing() {
+        let sched = sample().render_upssched_conf();
+        assert!(
+            !sched.lines().any(|l| l.starts_with("CMDSCRIPT") || l.starts_with("AT ")),
+            "{sched}"
+        );
+        assert!(sample().render_upsmon_conf().contains("NOTIFYCMD "));
     }
 
     #[test]

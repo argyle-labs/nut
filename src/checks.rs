@@ -21,8 +21,8 @@ use plugin_toolkit::contract::diagnostics::{
 
 use crate::client::{NutClient, Ups, DEFAULT_PORT};
 use crate::config::{
-    detect_conf_dir, detect_init, marker_value, privilege_hint, read_or_empty, strip_comment,
-    tokenize, InitSystem, NotifySettings, NutConfig, UpsmonSettings,
+    detect_conf_dir, detect_init, marker_raw, marker_value, privilege_hint, read_or_empty,
+    strip_comment, tokenize, InitSystem, NotifySettings, NutConfig, UpsmonSettings,
 };
 use crate::notify;
 
@@ -400,15 +400,16 @@ fn check_onbattery_capture(upssched: &str) -> Option<Finding> {
     if upssched.trim().is_empty() {
         return None; // upssched not configured yet — covered elsewhere.
     }
-    let has_hook = upssched
-        .lines()
-        .any(|l| l.contains("ONBATT") && l.contains("onbattery-capture"));
+    let has_hook = marker_raw(upssched, "orca-onbattery-capture").is_some_and(|v| !v.is_empty())
+        || upssched
+            .lines()
+            .any(|l| l.contains("ONBATT") && l.contains("onbattery-capture"));
     if has_hook {
         Some(finding(
             "onbattery-capture",
             Severity::Ok,
             "On-battery diagnostics capture is installed",
-            "an ONBATT upssched hook snapshots diagnostics to flash + remote before \
+            "an ONBATT hook snapshots diagnostics to flash + remote before \
              shutdown proceeds."
                 .to_string(),
             None,
