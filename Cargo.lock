@@ -1750,6 +1750,7 @@ dependencies = [
 name = "nut"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "plugin-toolkit",
  "serde",
  "tempfile",
