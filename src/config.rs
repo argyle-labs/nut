@@ -152,12 +152,12 @@ impl Default for UpsmonSettings {
 
 /// Notification / event-capture wiring for `upsmon.conf` + `upssched.conf`.
 ///
-/// The survivable-logging path: on events `upsmon` calls `upssched`, whose
-/// command handler logs to flash (`log_path`) and forwards to a remote syslog
+/// The survivable-logging path: on events `upsmon` calls the handler
+/// (`NOTIFYCMD`), which logs to flash (`log_path`), forwards to a remote syslog
 /// target, and on `ONBATT` runs the diagnostics snapshot before shutdown.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NotifySettings {
-    /// Path `upssched` invokes as its command handler (`NOTIFYCMD`/`CMDSCRIPT`).
+    /// Handler path, written as `NOTIFYCMD` (and `CMDSCRIPT` in `upssched.conf`).
     pub notify_cmd: String,
     /// `upssched` command pipe/lock paths.
     pub pipe: String,
@@ -203,7 +203,7 @@ impl NotifySettings {
 
 const MANAGED_HEADER: &str = "# Managed by orca (nut plugin). Do not edit by hand.\n";
 
-const MANAGED_EVENTS: [&str; 6] = [
+pub(crate) const MANAGED_EVENTS: [&str; 6] = [
     "ONLINE", "ONBATT", "LOWBATT", "COMMBAD", "COMMOK", "SHUTDOWN",
 ];
 
@@ -271,9 +271,31 @@ impl NutConfig {
     }
 
     /// Write every rendered file into `dir`, only touching files whose content
-    /// changed, then restart the NUT daemons this topology runs.
+    /// changed, then restart the NUT daemons this topology runs. The notify
+    /// handler is installed first; a config naming one that cannot be installed
+    /// is never written.
     pub fn apply(&self, dir: &Path) -> Result<ApplyOutcome, String> {
-        self.apply_with(dir, &SystemServices::new(), Path::new("/etc/group"))
+        self.apply_gated(dir, &crate::notify::ensure_installed, |cfg| {
+            cfg.apply_with(dir, &SystemServices::new(), Path::new("/etc/group"))
+        })
+    }
+
+    /// [`apply`](Self::apply) with an injectable handler installer and writer.
+    pub(crate) fn apply_gated(
+        &self,
+        dir: &Path,
+        install: &dyn Fn(&str) -> Result<Option<bool>, String>,
+        write: impl FnOnce(&Self) -> Result<ApplyOutcome, String>,
+    ) -> Result<ApplyOutcome, String> {
+        self.check_values()
+            .map_err(|e| format!("refusing to apply: {e}"))?;
+        install(&self.notify.notify_cmd).map_err(|e| {
+            format!(
+                "notify handler not installed ({e}); nothing written in {}",
+                dir.display()
+            )
+        })?;
+        write(self)
     }
 
     /// [`apply`](Self::apply) with injectable service control and group file.
@@ -685,7 +707,7 @@ impl NutConfig {
         }
         out.push_str(&format!("HOSTSYNC {}\n", s.host_sync));
         out.push_str(&format!("DEADTIME {}\n", s.dead_time));
-        // Route every event through upssched so logging + capture run.
+        // upsmon hands every managed event straight to the handler.
         out.push_str(&format!("NOTIFYCMD {}\n", quote_token(&n.notify_cmd)));
         for event in MANAGED_EVENTS {
             let mut flags = MANAGED_FLAGS.to_vec();
@@ -1374,7 +1396,7 @@ pub(crate) fn marker_value(upssched: &str, key: &str) -> Option<String> {
 }
 
 /// The trimmed text after an `# orca-<key> ` marker prefix.
-fn marker_raw<'a>(upssched: &'a str, key: &str) -> Option<&'a str> {
+pub(crate) fn marker_raw<'a>(upssched: &'a str, key: &str) -> Option<&'a str> {
     let prefix = format!("# {key} ");
     upssched
         .lines()
@@ -2149,6 +2171,21 @@ NOTIFYFLAG REPLBATT SYSLOG+WALL\n";
         cfg.upses[0].extra = vec![("# a note".into(), String::new())];
         cfg.notify_flags = vec![("ONBATT".into(), "WALL+EXEC".into())];
         assert!(cfg.check_values().is_ok());
+    }
+
+    #[test]
+    fn invalid_config_is_refused_before_install() {
+        let mut cfg = sample();
+        cfg.upses[0].name = "server ups".into();
+        let dir = tempfile::tempdir().unwrap();
+        let err = cfg
+            .apply_gated(
+                dir.path(),
+                &|_| panic!("installed despite invalid config"),
+                |_| panic!("wrote despite invalid config"),
+            )
+            .unwrap_err();
+        assert!(err.starts_with("refusing to apply"), "{err}");
     }
 
     #[test]

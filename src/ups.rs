@@ -94,9 +94,18 @@ fn merged_config(dir: &Path, cfg: &UpsConfig, unraid: bool) -> Result<NutConfig,
 /// merging onto whatever is already configured so an operator's UPS/monitor
 /// topology is preserved.
 pub fn config_set_typed(cfg: UpsConfig) -> UpsConfigOutcome {
-    let dir = detect_conf_dir();
     let unraid = detect_init(Path::new("/")) == InitSystem::Unraid;
-    match merged_config(&dir, &cfg, unraid).and_then(|nut| nut.apply(&dir)) {
+    config_set_in(&detect_conf_dir(), unraid, cfg, |nut, dir| nut.apply(dir))
+}
+
+/// [`config_set_typed`] against `dir` with an injectable `apply`.
+fn config_set_in(
+    dir: &Path,
+    unraid: bool,
+    cfg: UpsConfig,
+    apply: impl FnOnce(&NutConfig, &Path) -> Result<crate::config::ApplyOutcome, String>,
+) -> UpsConfigOutcome {
+    match merged_config(dir, &cfg, unraid).and_then(|nut| apply(&nut, dir)) {
         Ok(out) if out.written.is_empty() => UpsConfigOutcome {
             id: cfg.id,
             provider: crate::PROVIDER.to_string(),
@@ -264,6 +273,37 @@ mod tests {
         assert_ne!(mon_after, mon);
         assert_eq!(before("upssched.conf"), sched);
         assert!(sched.contains("# orca-remote-syslog 10.0.0.9:514"));
+    }
+
+    #[test]
+    fn config_set_writes_nothing_when_the_handler_install_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("upsmon.conf"),
+            "MONITOR serverups@localhost 1 u p master\nSHUTDOWNCMD \"/sbin/halt\"\n",
+        )
+        .unwrap();
+        let before = std::fs::read_dir(dir.path()).unwrap().count();
+        let out = config_set_in(
+            dir.path(),
+            false,
+            UpsConfig {
+                kill_power: Some(true),
+                ..Default::default()
+            },
+            |nut, d| {
+                nut.apply_gated(d, &|_| Err("denied".into()), |_| {
+                    panic!("wrote despite a failed install")
+                })
+            },
+        );
+        assert!(!out.ok);
+        assert!(
+            out.message.contains("notify handler not installed"),
+            "{}",
+            out.message
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), before);
     }
 
     #[test]

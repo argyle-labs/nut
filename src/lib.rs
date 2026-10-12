@@ -18,6 +18,7 @@ use plugin_toolkit::service::{
 pub mod checks;
 pub mod client;
 pub mod config;
+pub mod notify;
 pub mod registration;
 pub mod ups;
 
