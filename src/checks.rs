@@ -414,16 +414,17 @@ fn repair_write_config(what: &str) -> (bool, String) {
     // don't clobber an operator's UPS/monitor topology.
     let cfg = merged_safe_config(&dir);
     match cfg.apply(&dir) {
-        Ok(written) if written.is_empty() => (
+        Ok(out) if out.written.is_empty() => (
             true,
             format!("{what} already in place at {}", dir.display()),
         ),
-        Ok(written) => (
+        Ok(out) => (
             true,
             format!(
-                "applied {what}: wrote {} in {}",
-                written.join(", "),
-                dir.display()
+                "applied {what}: wrote {} in {}; {}",
+                out.written.join(", "),
+                dir.display(),
+                out.message
             ),
         ),
         Err(e) => (

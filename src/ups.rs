@@ -87,19 +87,24 @@ pub fn config_set_typed(cfg: UpsConfig) -> UpsConfigOutcome {
         }
     }
     match nut.apply(&dir) {
-        Ok(written) if written.is_empty() => UpsConfigOutcome {
+        Ok(out) if out.written.is_empty() => UpsConfigOutcome {
             id: cfg.id,
             provider: crate::PROVIDER.to_string(),
             ok: true,
             message: format!("config already in place at {}", dir.display()),
             restart_required: false,
         },
-        Ok(written) => UpsConfigOutcome {
+        Ok(out) => UpsConfigOutcome {
             id: cfg.id,
             provider: crate::PROVIDER.to_string(),
             ok: true,
-            message: format!("wrote {} in {}", written.join(", "), dir.display()),
-            restart_required: false,
+            message: format!(
+                "wrote {} in {}; {}",
+                out.written.join(", "),
+                dir.display(),
+                out.message
+            ),
+            restart_required: out.restart_required,
         },
         Err(e) => UpsConfigOutcome {
             id: cfg.id,

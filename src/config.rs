@@ -193,56 +193,99 @@ impl NutConfig {
     }
 
     /// Write every rendered file into `dir`, only touching files whose content
-    /// changed. Returns the names of the files actually written (empty = no-op).
-    pub fn apply(&self, dir: &Path) -> Result<Vec<String>, String> {
-        self.apply_with(dir, &SystemServices)
+    /// changed, then restart the NUT daemons this topology runs.
+    pub fn apply(&self, dir: &Path) -> Result<ApplyOutcome, String> {
+        self.apply_with(dir, &SystemServices::new(), Path::new("/etc/group"))
     }
 
-    /// [`apply`](Self::apply) with injectable service control. When anything
-    /// changed, the daemons are stopped around the writes and always started
-    /// again, even if a write failed.
+    /// [`apply`](Self::apply) with injectable service control and group file.
+    ///
+    /// Every changed file is fully staged (written, chmod, chown, fsync) before
+    /// any rename; the renames then run back to back and are rolled back if one
+    /// fails. `Err` means the old config is still in place; once the renames
+    /// land the outcome is `Ok`, with restart problems in `restart_required`.
     pub fn apply_with(
         &self,
         dir: &Path,
         services: &dyn ServiceControl,
-    ) -> Result<Vec<String>, String> {
+        group_file: &Path,
+    ) -> Result<ApplyOutcome, String> {
         std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-        let changed: Vec<RenderedFile> = self
-            .render()
-            .into_iter()
-            .filter(|f| {
-                std::fs::read_to_string(dir.join(f.name)).ok().as_deref()
-                    != Some(f.contents.as_str())
-            })
-            .collect();
-        if changed.is_empty() {
-            return Ok(Vec::new());
-        }
-        // A stop failure (e.g. monitor-only host without nut-server) is not
-        // fatal: writes are atomic, so a running daemon never sees a torn file.
-        let _stopped = services.stop();
-        let mut written = Vec::new();
-        let mut write_err = None;
-        for file in &changed {
+        let rendered = self.render();
+        sweep_stale_temps(dir, &rendered);
+        let mut changed = Vec::new();
+        for file in &rendered {
             let path = dir.join(file.name);
-            match write_atomic(&path, file.contents.as_bytes()) {
-                Ok(()) => written.push(file.name.to_string()),
+            // Symlinked targets are refused: renaming over the link would
+            // silently detach it from whatever it pointed at.
+            if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+                return Err(format!(
+                    "{} is a symlink; refusing to replace it",
+                    path.display()
+                ));
+            }
+            let old = std::fs::read(&path).ok();
+            if old.as_deref() != Some(file.contents.as_bytes()) {
+                changed.push((file, path, old));
+            }
+        }
+        if changed.is_empty() {
+            return Ok(ApplyOutcome::default());
+        }
+
+        let mut staged = Vec::new();
+        for (file, path, _) in &changed {
+            match stage(path, file.contents.as_bytes(), group_file) {
+                Ok(s) => staged.push(s),
                 Err(e) => {
-                    write_err = Some(e);
-                    break;
+                    for s in &staged {
+                        let _removed = std::fs::remove_file(&s.tmp);
+                    }
+                    return Err(e);
                 }
             }
         }
-        let started = services.start();
-        match (write_err, started) {
-            (None, Ok(())) => Ok(written),
-            (None, Err(s)) => Err(format!(
-                "wrote {} but NUT services failed to restart: {s}",
-                written.join(", ")
-            )),
-            (Some(w), Ok(())) => Err(format!("{w}; NUT services restarted")),
-            (Some(w), Err(s)) => Err(format!("{w}; NUT services failed to restart: {s}")),
+
+        for (i, s) in staged.iter().enumerate() {
+            if let Err(e) = std::fs::rename(&s.tmp, &s.path) {
+                let mut err = format!("rename {}: {e}", s.path.display());
+                for s in &staged[i..] {
+                    let _removed = std::fs::remove_file(&s.tmp);
+                }
+                for (j, s) in staged[..i].iter().enumerate().rev() {
+                    if let Err(r) = rollback(&s.path, changed[j].2.as_deref(), &s.meta, group_file)
+                    {
+                        err.push_str(&format!("; rollback {}: {r}", s.path.display()));
+                    }
+                }
+                return Err(err);
+            }
         }
+
+        let written: Vec<String> = changed.iter().map(|(f, _, _)| f.name.to_string()).collect();
+        let mut notes = Vec::new();
+        if let Err(e) = std::fs::File::open(dir).and_then(|d| d.sync_all()) {
+            notes.push(format!("fsync {}: {e}", dir.display()));
+        }
+        let restart_required = match services.restart(!self.upses.is_empty()) {
+            Restart::Done(units) => {
+                notes.push(format!("restarted {}", units.join(", ")));
+                false
+            }
+            Restart::Failed(e) => {
+                notes.push(format!("NUT restart failed: {e}"));
+                true
+            }
+            Restart::Unavailable(e) => {
+                notes.push(e);
+                true
+            }
+        };
+        Ok(ApplyOutcome {
+            written,
+            restart_required,
+            message: notes.join("; "),
+        })
     }
 
     fn render_ups_conf(&self) -> String {
@@ -337,46 +380,245 @@ pub fn detect_conf_dir() -> PathBuf {
     PathBuf::from(DEFAULT_CONF_DIR)
 }
 
-/// Stops/starts the NUT daemons around a config write.
-pub trait ServiceControl {
-    fn stop(&self) -> Result<(), String>;
-    fn start(&self) -> Result<(), String>;
+/// Result of an [`NutConfig::apply`] that got the new files into place.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApplyOutcome {
+    /// Files actually rewritten (empty = no-op).
+    pub written: Vec<String>,
+    /// The new config is on disk but the daemons may still run the old one.
+    pub restart_required: bool,
+    /// Restart / fsync notes for the operator; empty on a no-op.
+    pub message: String,
 }
 
-/// Real service control: systemd, falling back to OpenRC.
-pub struct SystemServices;
+/// What a [`ServiceControl::restart`] achieved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Restart {
+    /// Every listed unit was restarted.
+    Done(Vec<String>),
+    /// At least one restart failed; the message names each failure.
+    Failed(String),
+    /// No usable service manager (e.g. a container); nothing was attempted.
+    Unavailable(String),
+}
 
-impl ServiceControl for SystemServices {
-    fn stop(&self) -> Result<(), String> {
-        let systemd = crate::checks::run("systemctl", &["stop", "nut-monitor", "nut-server"]);
-        if systemd.is_ok() || crate::checks::run("rc-service", &["nut-server", "stop"]).is_ok() {
-            return Ok(());
+/// Restarts the NUT daemons after a config write.
+pub trait ServiceControl {
+    /// `server`: this host drives UPS hardware (drivers + `upsd` + `upsmon`);
+    /// otherwise it is a monitor-only client and only `upsmon` is touched.
+    fn restart(&self, server: bool) -> Restart;
+}
+
+/// The init system NUT runs under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitSystem {
+    /// Unraid (Slackware) with the NUT plugin's `/etc/rc.d/rc.nut`.
+    Unraid,
+    Systemd,
+    OpenRc,
+    None,
+}
+
+const RC_NUT: &str = "etc/rc.d/rc.nut";
+
+/// Detect the init system under `root` (`/` on a real host).
+pub fn detect_init(root: &Path) -> InitSystem {
+    if root.join(RC_NUT).is_file() {
+        InitSystem::Unraid
+    } else if root.join("run/systemd/system").is_dir() {
+        InitSystem::Systemd
+    } else if root.join("sbin/openrc-run").exists() || root.join("sbin/rc-service").exists() {
+        InitSystem::OpenRc
+    } else {
+        InitSystem::None
+    }
+}
+
+/// The Unraid NUT plugin's `MANUAL` setting when it is in GUI mode.
+///
+/// `rc.nut restart` runs the plugin's `write_config`, which in GUI mode
+/// (`MANUAL="disable"`/`"onlyups"`) rewrites lines of `ups.conf`/`upsmon.conf`
+/// from the plugin's own settings, clobbering ours. Only `MANUAL="enable"`
+/// leaves `/etc/nut` alone (it then just copies it to flash).
+fn unraid_gui_mode(root: &Path) -> Option<String> {
+    [
+        "boot/config/plugins/nut-dw/nut-dw.cfg",
+        "boot/config/plugins/nut/nut.cfg",
+    ]
+    .iter()
+    .find_map(|cfg| std::fs::read_to_string(root.join(cfg)).ok())
+    .and_then(|cfg| {
+        cfg.lines().find_map(|l| {
+            let v = l.trim().strip_prefix("MANUAL=")?;
+            Some(v.trim_matches('"').to_string())
+        })
+    })
+    .filter(|m| m != "enable")
+}
+
+type Runner = Box<dyn Fn(&str, &[&str]) -> Result<String, String>>;
+
+/// Real service control for the detected [`InitSystem`].
+pub struct SystemServices {
+    root: PathBuf,
+    run: Runner,
+}
+
+impl SystemServices {
+    pub fn new() -> Self {
+        Self {
+            root: PathBuf::from("/"),
+            run: Box::new(crate::checks::run),
         }
-        systemd.map(|_| ())
     }
 
-    fn start(&self) -> Result<(), String> {
-        let systemd = crate::checks::run("systemctl", &["start", "nut-server", "nut-monitor"]);
-        if systemd.is_ok() || crate::checks::run("rc-service", &["nut-server", "start"]).is_ok() {
-            return Ok(());
+    /// The `(bin, args)` restarts for this topology, only for units that exist.
+    fn plan(&self, init: InitSystem, server: bool) -> Vec<(String, Vec<String>)> {
+        match init {
+            InitSystem::Unraid => {
+                // rc.nut picks driver/upsd/upsmon from its own MODE.
+                let rc = self.root.join(RC_NUT).to_string_lossy().into_owned();
+                vec![(rc, vec!["restart".to_string()])]
+            }
+            InitSystem::Systemd => {
+                let mut units = Vec::new();
+                if server {
+                    // NUT >= 2.8 drives per-UPS nut-driver@ instances via the target.
+                    if let Some(d) = ["nut-driver.target", "nut-driver.service"]
+                        .into_iter()
+                        .find(|u| (self.run)("systemctl", &["cat", u]).is_ok())
+                    {
+                        units.push(d);
+                    }
+                    units.push("nut-server.service");
+                }
+                units.push("nut-monitor.service");
+                units
+                    .into_iter()
+                    .filter(|u| (self.run)("systemctl", &["cat", u]).is_ok())
+                    .map(|u| {
+                        let args = vec!["restart".to_string(), u.to_string()];
+                        ("systemctl".to_string(), args)
+                    })
+                    .collect()
+            }
+            InitSystem::OpenRc => {
+                // Alpine: nut-upsd (starts the drivers too) + nut-upsmon.
+                // Gentoo: upsdrv + upsd + upsmon.
+                let mut names = Vec::new();
+                if server {
+                    names.extend(["nut-upsd", "upsdrv", "upsd"]);
+                }
+                names.extend(["nut-upsmon", "upsmon"]);
+                names
+                    .into_iter()
+                    .filter(|n| self.root.join("etc/init.d").join(n).exists())
+                    .map(|n| {
+                        let args = vec![n.to_string(), "restart".to_string()];
+                        ("rc-service".to_string(), args)
+                    })
+                    .collect()
+            }
+            InitSystem::None => Vec::new(),
         }
-        systemd.map(|_| ())
+    }
+}
+
+impl Default for SystemServices {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ServiceControl for SystemServices {
+    fn restart(&self, server: bool) -> Restart {
+        let init = detect_init(&self.root);
+        if init == InitSystem::Unraid {
+            if let Some(mode) = unraid_gui_mode(&self.root) {
+                return Restart::Unavailable(format!(
+                    "Unraid NUT plugin is in GUI mode (MANUAL={mode}); `rc.nut restart` would \
+                     overwrite the new config. Switch the plugin to manual config mode, then run \
+                     /etc/rc.d/rc.nut restart"
+                ));
+            }
+        }
+        let plan = self.plan(init, server);
+        if plan.is_empty() {
+            return Restart::Unavailable(format!(
+                "no NUT service manager found ({init:?}); restart NUT to load the new config"
+            ));
+        }
+        let mut done = Vec::new();
+        let mut failed = Vec::new();
+        for (bin, args) in &plan {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let label = format!("{bin} {}", args.join(" "));
+            match (self.run)(bin, &args) {
+                Ok(_) => done.push(label),
+                Err(e) => failed.push(format!("{label}: {e}")),
+            }
+        }
+        if failed.is_empty() {
+            Restart::Done(done)
+        } else if done.is_empty() {
+            Restart::Failed(failed.join("; "))
+        } else {
+            Restart::Failed(format!(
+                "{} (restarted {})",
+                failed.join("; "),
+                done.join(", ")
+            ))
+        }
     }
 }
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Replace `path` atomically: same-dir temp file created with the final mode,
-/// fsync, rename, fsync the directory. Keeps the existing file's mode/uid/gid;
-/// a new file gets 0640 root:nut (upsmon.conf carries the MONITOR password).
-fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), String> {
+/// A fully written temp file ready to be renamed over `path`.
+struct Staged {
+    tmp: PathBuf,
+    path: PathBuf,
+    meta: Option<std::fs::Metadata>,
+}
+
+/// Write `contents` to a same-dir temp file with the target's final mode and
+/// owner, fsynced. Keeps an existing file's mode/uid/gid (upsmon.conf is clamped
+/// to at most 0640 since it carries the MONITOR password); a new file gets 0640
+/// root:nut.
+fn stage(path: &Path, contents: &[u8], group_file: &Path) -> Result<Staged, String> {
+    let meta = std::fs::metadata(path).ok();
+    let tmp = stage_with(path, contents, meta.as_ref(), group_file)?;
+    Ok(Staged {
+        tmp,
+        path: path.to_path_buf(),
+        meta,
+    })
+}
+
+fn stage_with(
+    path: &Path,
+    contents: &[u8],
+    existing: Option<&std::fs::Metadata>,
+    group_file: &Path,
+) -> Result<PathBuf, String> {
     let dir = path.parent().unwrap_or(Path::new("."));
-    let existing = std::fs::metadata(path).ok();
-    let (mode, uid, gid) = match &existing {
-        Some(m) => (m.mode() & 0o7777, Some(m.uid()), Some(m.gid())),
-        None => (0o640, Some(0), nut_gid()),
-    };
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("conf");
+    let (mut mode, uid, gid) = match existing {
+        Some(m) => (m.mode() & 0o7777, m.uid(), m.gid()),
+        None => {
+            let gid = nut_gid(group_file).ok_or_else(|| {
+                format!(
+                    "no `nut` group in {}; cannot create {} as root:nut",
+                    group_file.display(),
+                    path.display()
+                )
+            })?;
+            (0o640, 0, gid)
+        }
+    };
+    if name == "upsmon.conf" {
+        mode &= 0o640;
+    }
     let tmp = dir.join(format!(
         ".{name}.{}.{}.tmp",
         std::process::id(),
@@ -392,34 +634,70 @@ fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), String> {
         // `mode()` is masked by the umask; set it explicitly.
         f.set_permissions(std::fs::Permissions::from_mode(mode))
             .map_err(|e| format!("chmod {}: {e}", tmp.display()))?;
-        // Unprivileged callers cannot chown a new file to root:nut; that is
-        // tolerated, but failing to preserve an existing owner is an error.
-        if let Err(e) = std::os::unix::fs::fchown(&f, uid, gid) {
+        // An unprivileged caller cannot chown to another owner; that is only
+        // an error if the result differs from the owner we must keep.
+        if let Err(e) = std::os::unix::fs::fchown(&f, Some(uid), Some(gid)) {
             let m = f
                 .metadata()
                 .map_err(|e| format!("stat {}: {e}", tmp.display()))?;
-            let mismatch = uid.is_some_and(|u| u != m.uid()) || gid.is_some_and(|g| g != m.gid());
-            if existing.is_some() && mismatch {
+            if existing.is_some() && (m.uid(), m.gid()) != (uid, gid) {
                 return Err(format!("chown {}: {e}", tmp.display()));
             }
         }
         f.write_all(contents)
             .and_then(|_| f.sync_all())
-            .map_err(|e| format!("write {}: {e}", tmp.display()))?;
-        std::fs::rename(&tmp, path).map_err(|e| format!("rename {}: {e}", path.display()))?;
-        std::fs::File::open(dir)
-            .and_then(|d| d.sync_all())
-            .map_err(|e| format!("fsync {}: {e}", dir.display()))
+            .map_err(|e| format!("write {}: {e}", tmp.display()))
     })();
-    if result.is_err() {
-        let _removed = std::fs::remove_file(&tmp);
+    match result {
+        Ok(()) => Ok(tmp),
+        Err(e) => {
+            let _removed = std::fs::remove_file(&tmp);
+            Err(e)
+        }
     }
-    result
 }
 
-/// gid of the `nut` group from /etc/group, if present.
-fn nut_gid() -> Option<u32> {
-    let groups = std::fs::read_to_string("/etc/group").ok()?;
+/// Undo an already-renamed file: restore `old` with its original metadata, or
+/// remove the file if it did not exist before.
+fn rollback(
+    path: &Path,
+    old: Option<&[u8]>,
+    meta: &Option<std::fs::Metadata>,
+    group_file: &Path,
+) -> Result<(), String> {
+    match old {
+        Some(old) => {
+            let tmp = stage_with(path, old, meta.as_ref(), group_file)?;
+            std::fs::rename(&tmp, path).map_err(|e| {
+                let _removed = std::fs::remove_file(&tmp);
+                e.to_string()
+            })
+        }
+        None => std::fs::remove_file(path).map_err(|e| e.to_string()),
+    }
+}
+
+/// Remove temp files a crashed earlier apply left behind (`.<name>.*.tmp`).
+fn sweep_stale_temps(dir: &Path, files: &[RenderedFile]) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let stale = name.ends_with(".tmp")
+            && files
+                .iter()
+                .any(|f| name.starts_with(&format!(".{}.", f.name)));
+        if stale {
+            let _removed = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// gid of the `nut` group from `group_file`, if present.
+fn nut_gid(group_file: &Path) -> Option<u32> {
+    let groups = std::fs::read_to_string(group_file).ok()?;
     groups.lines().find_map(|l| {
         let mut parts = l.split(':');
         (parts.next()? == "nut").then(|| parts.nth(1)?.parse().ok())?
@@ -472,13 +750,15 @@ mod tests {
 
     #[test]
     fn apply_round_trips_idempotently() {
-        let dir = tempfile::tempdir().unwrap();
+        let (dir, group) = setup();
         let cfg = sample();
         let svc = MockServices::default();
-        let first = cfg.apply_with(dir.path(), &svc).unwrap();
-        assert_eq!(first.len(), 4, "first apply writes all four files");
-        let second = cfg.apply_with(dir.path(), &svc).unwrap();
-        assert!(second.is_empty(), "re-apply is a no-op: {second:?}");
+        let first = cfg.apply_with(dir.path(), &svc, &group).unwrap();
+        assert_eq!(first.written.len(), 4, "first apply writes all four files");
+        assert!(!first.restart_required);
+        let second = cfg.apply_with(dir.path(), &svc, &group).unwrap();
+        assert_eq!(second, ApplyOutcome::default(), "re-apply is a no-op");
+        assert_eq!(*svc.calls.borrow(), vec![true]);
     }
 
     #[test]
@@ -518,92 +798,267 @@ mod tests {
         let mon = cfg.render_upsmon_conf();
         assert!(mon.contains("MONITOR serverups@upshost 1 monuser secretref slave"));
     }
+
+    /// A config dir plus a separate group file mapping `nut` to the caller's
+    /// gid, so staging's chown succeeds unprivileged.
+    fn setup() -> (tempfile::TempDir, tempfile::TempPath) {
+        let dir = tempfile::tempdir().unwrap();
+        let gid = std::fs::metadata(dir.path()).unwrap().gid();
+        let mut group = tempfile::NamedTempFile::new().unwrap();
+        write!(group, "root:x:0:\nnut:x:{gid}:\n").unwrap();
+        (dir, group.into_temp_path())
+    }
+
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
     #[derive(Default)]
     struct MockServices {
-        stops: std::cell::Cell<u32>,
-        starts: std::cell::Cell<u32>,
+        calls: std::cell::RefCell<Vec<bool>>,
     }
 
     impl ServiceControl for MockServices {
-        fn stop(&self) -> Result<(), String> {
-            self.stops.set(self.stops.get() + 1);
-            Ok(())
-        }
-        fn start(&self) -> Result<(), String> {
-            self.starts.set(self.starts.get() + 1);
-            Ok(())
+        fn restart(&self, server: bool) -> Restart {
+            self.calls.borrow_mut().push(server);
+            Restart::Done(vec!["mock".into()])
         }
     }
 
     #[test]
     fn atomic_write_leaves_no_temp_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let (dir, group) = setup();
         sample()
-            .apply_with(dir.path(), &MockServices::default())
+            .apply_with(dir.path(), &MockServices::default(), &group)
             .unwrap();
-        let mut names: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name().into_string().unwrap())
-            .collect();
-        names.sort();
         assert_eq!(
-            names,
+            entries(dir.path()),
             vec!["ups.conf", "upsd.conf", "upsmon.conf", "upssched.conf"]
         );
     }
 
     #[test]
     fn new_file_is_0640_and_existing_mode_owner_preserved() {
-        let dir = tempfile::tempdir().unwrap();
-        let mon = dir.path().join("upsmon.conf");
+        let (dir, group) = setup();
+        let ups = dir.path().join("ups.conf");
         sample()
-            .apply_with(dir.path(), &MockServices::default())
+            .apply_with(dir.path(), &MockServices::default(), &group)
             .unwrap();
-        assert_eq!(std::fs::metadata(&mon).unwrap().mode() & 0o7777, 0o640);
+        assert_eq!(std::fs::metadata(&ups).unwrap().mode() & 0o7777, 0o640);
 
-        std::fs::write(&mon, "stale").unwrap();
-        std::fs::set_permissions(&mon, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let before = std::fs::metadata(&mon).unwrap();
+        std::fs::write(&ups, "stale").unwrap();
+        std::fs::set_permissions(&ups, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let before = std::fs::metadata(&ups).unwrap();
         sample()
-            .apply_with(dir.path(), &MockServices::default())
+            .apply_with(dir.path(), &MockServices::default(), &group)
             .unwrap();
-        let after = std::fs::metadata(&mon).unwrap();
+        let after = std::fs::metadata(&ups).unwrap();
         assert_eq!(after.mode() & 0o7777, 0o600);
         assert_eq!((after.uid(), after.gid()), (before.uid(), before.gid()));
         assert_ne!(after.ino(), before.ino(), "replaced via rename");
     }
 
     #[test]
-    fn unchanged_config_does_not_stop_services() {
-        let dir = tempfile::tempdir().unwrap();
+    fn upsmon_conf_mode_is_clamped_to_0640() {
+        let (dir, group) = setup();
+        let mon = dir.path().join("upsmon.conf");
+        std::fs::write(&mon, "stale").unwrap();
+        std::fs::set_permissions(&mon, std::fs::Permissions::from_mode(0o664)).unwrap();
         sample()
-            .apply_with(dir.path(), &MockServices::default())
+            .apply_with(dir.path(), &MockServices::default(), &group)
             .unwrap();
-        let svc = MockServices::default();
-        sample().apply_with(dir.path(), &svc).unwrap();
-        assert_eq!((svc.stops.get(), svc.starts.get()), (0, 0));
+        assert_eq!(std::fs::metadata(&mon).unwrap().mode() & 0o7777, 0o640);
     }
 
     #[test]
-    fn write_failure_still_restarts_services() {
-        let dir = tempfile::tempdir().unwrap();
-        // A directory where a file must go makes the rename fail.
+    fn unchanged_config_does_not_restart_services() {
+        let (dir, group) = setup();
+        sample()
+            .apply_with(dir.path(), &MockServices::default(), &group)
+            .unwrap();
+        let svc = MockServices::default();
+        sample().apply_with(dir.path(), &svc, &group).unwrap();
+        assert!(svc.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn monitor_only_config_restarts_client_only() {
+        let (dir, group) = setup();
+        let cfg = NutConfig {
+            monitors: sample().monitors,
+            ..Default::default()
+        };
+        let svc = MockServices::default();
+        cfg.apply_with(dir.path(), &svc, &group).unwrap();
+        assert_eq!(*svc.calls.borrow(), vec![false]);
+    }
+
+    #[test]
+    fn rename_failure_rolls_back_and_skips_restart() {
+        let (dir, group) = setup();
+        std::fs::write(dir.path().join("ups.conf"), "old").unwrap();
+        // A non-empty directory where upsd.conf must go makes its rename fail
+        // after ups.conf has already been renamed.
         std::fs::create_dir(dir.path().join("upsd.conf")).unwrap();
         std::fs::write(dir.path().join("upsd.conf").join("x"), "").unwrap();
         let svc = MockServices::default();
-        let err = sample().apply_with(dir.path(), &svc).unwrap_err();
-        assert!(err.contains("NUT services restarted"), "{err}");
-        assert_eq!((svc.stops.get(), svc.starts.get()), (1, 1));
-        let leftovers = std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter(|e| {
-                e.as_ref()
-                    .unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .ends_with(".tmp")
-            })
-            .count();
-        assert_eq!(leftovers, 0);
+        let err = sample().apply_with(dir.path(), &svc, &group).unwrap_err();
+        assert!(err.contains("rename"), "{err}");
+        assert!(svc.calls.borrow().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("ups.conf")).unwrap(),
+            "old"
+        );
+        assert_eq!(entries(dir.path()), vec!["ups.conf", "upsd.conf"]);
+    }
+
+    #[test]
+    fn missing_nut_group_stages_nothing() {
+        let (dir, _) = setup();
+        let group = dir.path().join("nogroup");
+        std::fs::write(&group, "root:x:0:\n").unwrap();
+        let svc = MockServices::default();
+        let err = sample().apply_with(dir.path(), &svc, &group).unwrap_err();
+        assert!(err.contains("no `nut` group"), "{err}");
+        assert_eq!(entries(dir.path()), vec!["nogroup"]);
+        assert!(svc.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn symlinked_target_is_refused() {
+        let (dir, group) = setup();
+        std::fs::write(dir.path().join("real"), "x").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("upsd.conf")).unwrap();
+        let err = sample()
+            .apply_with(dir.path(), &MockServices::default(), &group)
+            .unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+    }
+
+    type Log = std::rc::Rc<std::cell::RefCell<Vec<String>>>;
+
+    /// Services rooted at a fake `/`; `systemctl cat` succeeds for `units`.
+    fn fake_services(root: &Path, units: &'static [&'static str]) -> (SystemServices, Log) {
+        let log: Log = Default::default();
+        let l = log.clone();
+        let svc = SystemServices {
+            root: root.to_path_buf(),
+            run: Box::new(move |bin, args| {
+                if bin == "systemctl" && args[0] == "cat" {
+                    return if units.contains(&args[1]) {
+                        Ok(String::new())
+                    } else {
+                        Err("no such unit".into())
+                    };
+                }
+                l.borrow_mut().push(format!("{bin} {}", args.join(" ")));
+                Ok(String::new())
+            }),
+        };
+        (svc, log)
+    }
+
+    fn touch(root: &Path, rel: &str) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, "").unwrap();
+    }
+
+    #[test]
+    fn unraid_restarts_via_rc_nut() {
+        let root = tempfile::tempdir().unwrap();
+        touch(root.path(), RC_NUT);
+        std::fs::create_dir_all(root.path().join("run/systemd/system")).unwrap();
+        touch(root.path(), "boot/config/plugins/nut-dw/nut-dw.cfg");
+        std::fs::write(
+            root.path().join("boot/config/plugins/nut-dw/nut-dw.cfg"),
+            "MANUAL=\"enable\"\n",
+        )
+        .unwrap();
+        let (svc, log) = fake_services(root.path(), &[]);
+        assert_eq!(detect_init(root.path()), InitSystem::Unraid);
+        assert!(matches!(svc.restart(false), Restart::Done(_)));
+        let rc = root.path().join(RC_NUT);
+        assert_eq!(*log.borrow(), vec![format!("{} restart", rc.display())]);
+    }
+
+    #[test]
+    fn unraid_gui_mode_does_not_restart() {
+        let root = tempfile::tempdir().unwrap();
+        touch(root.path(), RC_NUT);
+        touch(root.path(), "boot/config/plugins/nut/nut.cfg");
+        std::fs::write(
+            root.path().join("boot/config/plugins/nut/nut.cfg"),
+            "MANUAL=\"disable\"\n",
+        )
+        .unwrap();
+        let (svc, log) = fake_services(root.path(), &[]);
+        assert!(matches!(svc.restart(true), Restart::Unavailable(_)));
+        assert!(log.borrow().is_empty());
+    }
+
+    #[test]
+    fn systemd_monitor_only_restarts_only_upsmon() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("run/systemd/system")).unwrap();
+        let (svc, log) = fake_services(root.path(), &["nut-monitor.service"]);
+        assert!(matches!(svc.restart(false), Restart::Done(_)));
+        assert_eq!(*log.borrow(), vec!["systemctl restart nut-monitor.service"]);
+    }
+
+    #[test]
+    fn systemd_server_restarts_existing_units_in_order() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("run/systemd/system")).unwrap();
+        let (svc, log) = fake_services(
+            root.path(),
+            &[
+                "nut-driver.target",
+                "nut-server.service",
+                "nut-monitor.service",
+            ],
+        );
+        assert!(matches!(svc.restart(true), Restart::Done(_)));
+        assert_eq!(
+            *log.borrow(),
+            vec![
+                "systemctl restart nut-driver.target",
+                "systemctl restart nut-server.service",
+                "systemctl restart nut-monitor.service",
+            ]
+        );
+    }
+
+    #[test]
+    fn openrc_restarts_present_scripts() {
+        let root = tempfile::tempdir().unwrap();
+        touch(root.path(), "sbin/openrc-run");
+        touch(root.path(), "etc/init.d/nut-upsd");
+        touch(root.path(), "etc/init.d/nut-upsmon");
+        let (svc, log) = fake_services(root.path(), &[]);
+        svc.restart(true);
+        assert_eq!(
+            *log.borrow(),
+            vec![
+                "rc-service nut-upsd restart",
+                "rc-service nut-upsmon restart"
+            ]
+        );
+        log.borrow_mut().clear();
+        svc.restart(false);
+        assert_eq!(*log.borrow(), vec!["rc-service nut-upsmon restart"]);
+    }
+
+    #[test]
+    fn no_init_system_is_unavailable() {
+        let root = tempfile::tempdir().unwrap();
+        let (svc, log) = fake_services(root.path(), &[]);
+        assert!(matches!(svc.restart(true), Restart::Unavailable(_)));
+        assert!(log.borrow().is_empty());
     }
 }
