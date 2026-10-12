@@ -3,7 +3,7 @@
 //!
 //! It is the plugin binary itself, reached through a symlink (a copy on Unraid)
 //! named [`HANDLER_NAME`]; `main` dispatches here when `argv[0]` carries that name.
-//! It reads the `# orca-*` markers in `upssched.conf`, appends the event to
+//! It reads its targets from the `# orca-*` markers in `upssched.conf`, appends the event to
 //! `log_path`, forwards it to the remote syslog target, and on `ONBATT` runs the
 //! capture command. Every step is bounded and failures are swallowed: the
 //! handler always exits 0 so it can never block or crash `upsmon`.
@@ -17,9 +17,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::config::{
-    detect_conf_dir, detect_init, marker_raw, marker_value, InitSystem, MANAGED_EVENTS,
-};
+use crate::config::{detect_conf_dir, detect_init, marker_raw, marker_value, InitSystem};
 
 /// File name of the handler symlink; `main` dispatches on it.
 pub const HANDLER_NAME: &str = "orca-nut-notify";
@@ -41,27 +39,17 @@ pub fn invoked_as_handler(argv0: &str) -> bool {
     Path::new(argv0).file_name().and_then(|n| n.to_str()) == Some(HANDLER_NAME)
 }
 
-/// The commands the rendered `upssched.conf` names (`log-<event>`, `onbattery-capture`).
-fn is_upssched_command(arg: &str) -> bool {
-    arg == "onbattery-capture"
-        || arg
-            .strip_prefix("log-")
-            .is_some_and(|e| MANAGED_EVENTS.iter().any(|m| m.eq_ignore_ascii_case(e)))
-}
-
 /// One handler invocation, decoded from argv + environment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Event {
-    /// `NOTIFYTYPE` (upsmon) or the upssched command (`log-onbatt`, `onbattery-capture`).
+    /// `NOTIFYTYPE`, or argv[1] when upsmon set none.
     pub kind: String,
     pub ups: String,
     pub message: String,
 }
 
 impl Event {
-    /// upsmon passes the message as argv[1] with `NOTIFYTYPE`/`UPSNAME` set; an
-    /// upssched command in argv[1] wins over `NOTIFYTYPE`, which upssched
-    /// inherits from the upsmon that spawned it.
+    /// upsmon passes the message as argv[1] with `NOTIFYTYPE`/`UPSNAME` set.
     pub fn from_parts(
         args: &[String],
         notifytype: Option<String>,
@@ -69,7 +57,7 @@ impl Event {
     ) -> Self {
         let arg = args.first().cloned().unwrap_or_default();
         let ups = upsname.unwrap_or_default();
-        match notifytype.filter(|t| !t.is_empty() && !is_upssched_command(&arg)) {
+        match notifytype.filter(|t| !t.is_empty()) {
             Some(kind) => Self {
                 kind,
                 ups,
@@ -84,7 +72,7 @@ impl Event {
     }
 
     fn wants_capture(&self) -> bool {
-        self.kind.eq_ignore_ascii_case("ONBATT") || self.kind == "onbattery-capture"
+        self.kind.eq_ignore_ascii_case("ONBATT")
     }
 
     fn line(&self) -> String {
@@ -489,7 +477,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_upsmon_and_upssched_calls() {
+    fn decodes_upsmon_calls() {
         let e = Event::from_parts(
             &args(&["UPS ups@localhost on battery"]),
             Some("ONBATT".into()),
@@ -501,28 +489,9 @@ mod tests {
             e.line(),
             "event=ONBATT ups=ups@localhost msg=UPS ups@localhost on battery"
         );
-        let e = Event::from_parts(&args(&["log-online"]), None, None);
-        assert_eq!(e.kind, "log-online");
+        let e = Event::from_parts(&args(&["ONLINE"]), None, None);
+        assert_eq!(e.kind, "ONLINE");
         assert!(!e.wants_capture());
-        assert!(Event::from_parts(&args(&["onbattery-capture"]), None, None).wants_capture());
-    }
-
-    #[test]
-    fn upssched_command_wins_over_inherited_notifytype() {
-        let e = Event::from_parts(&args(&["log-onbatt"]), Some("ONBATT".into()), None);
-        assert_eq!(e.kind, "log-onbatt");
-        assert!(!e.wants_capture());
-        let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join("captured");
-        let out = handle(
-            &e,
-            &Targets {
-                capture_cmd: Some(format!("touch {}", marker.display())),
-                ..Targets::default()
-            },
-        );
-        assert!(out.capture.is_none());
-        assert!(!marker.exists());
     }
 
     #[test]
@@ -573,10 +542,7 @@ mod tests {
             remote_syslog: Some("not a host".into()),
             capture_cmd: Some("exit 3".into()),
         };
-        let out = handle(
-            &Event::from_parts(&args(&["onbattery-capture"]), None, None),
-            &targets,
-        );
+        let out = handle(&Event::from_parts(&args(&["ONBATT"]), None, None), &targets);
         assert!(matches!(out.log, Some(Err(_))));
         assert!(matches!(out.syslog, Some(Err(_))));
         assert!(matches!(out.capture, Some(Err(_))));

@@ -45,18 +45,23 @@ pub async fn diagnose_typed(_args: DiagnoseArgs) -> Vec<Finding> {
         Path::new("/"),
         apcupsd_present(),
         probe_upses(),
+        on_tmpfs,
+        notify::is_executable,
     )
     .await
 }
 
 /// [`diagnose_typed`] against an explicit config dir, filesystem root,
-/// apcupsd presence, and upsd probe, so tests never touch the host.
+/// apcupsd presence, upsd probe, tmpfs detection, and executable check, so tests
+/// never touch the host.
 /// `probe` is only awaited when a check needs it.
 async fn diagnose_in(
     dir: &Path,
     root: &Path,
     apcupsd: bool,
     probe: impl std::future::Future<Output = Result<Vec<Ups>, String>>,
+    tmpfs: fn(&Path) -> bool,
+    executable: fn(&Path) -> bool,
 ) -> Vec<Finding> {
     let mut findings: Vec<Finding> = Vec::new();
     let upsmon_parsed = read_upsmon_with_text(dir).unwrap_or_else(|e| {
@@ -113,11 +118,11 @@ async fn diagnose_in(
         &upsmon,
         &upssched,
         detect_init(root) == InitSystem::Unraid,
-        on_tmpfs,
+        tmpfs,
     ));
-    findings.extend(check_onbattery_capture(&upssched));
+    findings.extend(check_onbattery_capture(upsmon_text.as_deref(), &upssched));
     if let Some(text) = &upsmon_text {
-        findings.extend(check_notify_handler(text, notify::is_executable));
+        findings.extend(check_notify_handler(text, executable));
     }
     findings
 }
@@ -391,8 +396,8 @@ fn check_persistent_event_log(
             "persistent-event-log",
             Severity::Ok,
             "NUT events log to persistent flash and a remote target",
-            "upssched writes event records to persistent storage and forwards to remote syslog — \
-             they survive a power-cycle."
+            "the NOTIFYCMD handler writes event records to persistent storage and forwards to \
+             remote syslog — they survive a power-cycle."
                 .to_string(),
             None,
         ));
@@ -401,33 +406,35 @@ fn check_persistent_event_log(
         "persistent-event-log",
         Severity::Warn,
         "NUT event log is not survivable",
-        "NUT NOTIFYCMD/upssched logging is missing a persistent flash target and/or a \
+        "the NUT NOTIFYCMD handler's event log is missing a persistent flash target and/or a \
          remote syslog target; a power-cycle (which recovery requires) erases tmpfs \
          logs, destroying the evidence of what happened."
             .to_string(),
         Some(repair_spec(
             "persistent-event-log",
-            "Install upssched NOTIFY logging to persistent storage (/boot on Unraid) and a remote syslog target (privileged)",
+            "Configure NOTIFYCMD handler logging to persistent storage (/boot on Unraid) and a remote syslog target (privileged)",
         )),
     ))
 }
 
 /// `onbattery-capture`: no ONBATT hook snapshots diagnostics before shutdown.
-fn check_onbattery_capture(upssched: &str) -> Option<Finding> {
+/// The capture only fires when upsmon execs the orca handler on ONBATT, so the
+/// `upssched.conf` marker alone is not enough.
+fn check_onbattery_capture(upsmon: Option<&str>, upssched: &str) -> Option<Finding> {
+    let upsmon = upsmon?;
     if upssched.trim().is_empty() {
         return None; // upssched not configured yet — covered elsewhere.
     }
-    let has_hook = marker_raw(upssched, "orca-onbattery-capture").is_some_and(|v| !v.is_empty())
-        || upssched
-            .lines()
-            .any(|l| l.contains("ONBATT") && l.contains("onbattery-capture"));
-    if has_hook {
+    let has_cmd = marker_raw(upssched, "orca-onbattery-capture").is_some_and(|v| !v.is_empty());
+    let routed =
+        notify_cmd(upsmon).is_some_and(|c| notify::invoked_as_handler(&c)) && onbatt_execs(upsmon);
+    if has_cmd && routed {
         Some(finding(
             "onbattery-capture",
             Severity::Ok,
             "On-battery diagnostics capture is installed",
-            "an ONBATT hook snapshots diagnostics to flash + remote before \
-             shutdown proceeds."
+            "upsmon execs the orca NOTIFYCMD handler on ONBATT, which snapshots \
+             diagnostics to flash + remote before shutdown proceeds."
                 .to_string(),
             None,
         ))
@@ -436,17 +443,27 @@ fn check_onbattery_capture(upssched: &str) -> Option<Finding> {
             "onbattery-capture",
             Severity::Warn,
             "No on-battery diagnostics snapshot before shutdown",
-            "there is no ONBATT hook that captures diagnostics before the shutdown \
-             command runs; if the next shutdown hangs, there is no record of the \
+            "upsmon does not exec the orca NOTIFYCMD handler on ONBATT with a capture \
+             command configured; if the next shutdown hangs, there is no record of the \
              state at the moment of failure."
                 .to_string(),
             Some(repair_spec(
                 "onbattery-capture",
-                "Install an ONBATT upssched hook that runs `orca diagnostics diagnose` \
-                 and writes the snapshot to flash + remote before shutdown (privileged)",
+                "Point upsmon NOTIFYCMD at the orca handler with NOTIFYFLAG ONBATT EXEC, \
+                 which runs `orca diagnostics diagnose` and writes the snapshot to flash + \
+                 remote before shutdown (privileged)",
             )),
         ))
     }
+}
+
+fn onbatt_execs(upsmon: &str) -> bool {
+    upsmon.lines().any(|l| match tokenize(l).as_slice() {
+        [k, e, flags] => {
+            k == "NOTIFYFLAG" && e == "ONBATT" && flags.split('+').any(|f| f == "EXEC")
+        }
+        _ => false,
+    })
 }
 
 /// `notify-handler`: the `NOTIFYCMD` upsmon runs must exist and be executable,
@@ -1045,24 +1062,56 @@ DEADTIME 15
         assert_eq!(f.severity, Severity::Ok);
     }
 
-    #[test]
-    fn onbattery_capture_ok_for_managed_upssched() {
-        let rendered = NutConfig::default()
+    fn rendered(name: &str) -> String {
+        NutConfig::default()
             .render()
             .into_iter()
-            .find(|f| f.name == "upssched.conf")
+            .find(|f| f.name == name)
             .unwrap()
-            .contents;
-        let f = check_onbattery_capture(&rendered).expect("finding");
+            .contents
+    }
+
+    #[test]
+    fn onbattery_capture_ok_for_handler_with_exec() {
+        let upsmon = rendered("upsmon.conf");
+        let f =
+            check_onbattery_capture(Some(&upsmon), &rendered("upssched.conf")).expect("finding");
         assert_eq!(f.severity, Severity::Ok);
     }
 
     #[test]
-    fn onbattery_capture_warns_without_hook() {
+    fn onbattery_capture_warns_when_notifycmd_is_foreign() {
+        let upsmon = rendered("upsmon.conf")
+            .replace("/usr/local/bin/orca-nut-notify", "/usr/local/bin/mine");
         let f =
-            check_onbattery_capture("CMDSCRIPT /x\nAT ONLINE * EXECUTE log\n").expect("finding");
+            check_onbattery_capture(Some(&upsmon), &rendered("upssched.conf")).expect("finding");
         assert_eq!(f.severity, Severity::Warn);
         assert!(f.repair.is_some());
+    }
+
+    #[test]
+    fn onbattery_capture_warns_without_onbatt_exec() {
+        let upsmon: String = rendered("upsmon.conf")
+            .lines()
+            .map(|l| {
+                if l.starts_with("NOTIFYFLAG ONBATT") {
+                    "NOTIFYFLAG ONBATT SYSLOG\n".to_string()
+                } else {
+                    format!("{l}\n")
+                }
+            })
+            .collect();
+        let f =
+            check_onbattery_capture(Some(&upsmon), &rendered("upssched.conf")).expect("finding");
+        assert_eq!(f.severity, Severity::Warn);
+    }
+
+    #[test]
+    fn onbattery_capture_warns_without_hook() {
+        let upsmon = rendered("upsmon.conf");
+        let f = check_onbattery_capture(Some(&upsmon), "AT ONBATT * EXECUTE onbattery-capture\n")
+            .expect("finding");
+        assert_eq!(f.severity, Severity::Warn);
     }
 
     #[test]
@@ -1160,11 +1209,38 @@ DEADTIME 15
         let conf = write_upsmon(UPSMON_SAFE);
         let root = tempfile::tempdir().unwrap();
         let probe = async { Err("no upsd in tests".to_string()) };
-        let findings = diagnose_in(conf.path(), root.path(), false, probe).await;
+        let findings =
+            diagnose_in(conf.path(), root.path(), false, probe, |_| false, |_| false).await;
         assert!(!findings.is_empty());
         for f in &findings {
             assert_eq!(f.provider, crate::PROVIDER);
         }
+    }
+
+    #[tokio::test]
+    async fn diagnose_flags_event_log_on_tmpfs() {
+        let conf = write_upsmon(UPSMON_SAFE);
+        fs::write(
+            conf.path().join("upssched.conf"),
+            "# orca-log-path /var/log/nut/events.log\n# orca-remote-syslog 10.0.0.9:514\n",
+        )
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let severity = |findings: Vec<Finding>| {
+            findings
+                .into_iter()
+                .find(|f| f.id == "persistent-event-log")
+                .expect("finding")
+                .severity
+        };
+        let probe = async { Err("no upsd in tests".to_string()) };
+        let on_tmpfs =
+            diagnose_in(conf.path(), root.path(), false, probe, |_| true, |_| true).await;
+        assert_eq!(severity(on_tmpfs), Severity::Warn);
+        let probe = async { Err("no upsd in tests".to_string()) };
+        let on_disk =
+            diagnose_in(conf.path(), root.path(), false, probe, |_| false, |_| true).await;
+        assert_eq!(severity(on_disk), Severity::Ok);
     }
 
     #[test]
