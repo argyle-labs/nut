@@ -20,7 +20,10 @@ use plugin_toolkit::contract::diagnostics::{
 };
 
 use crate::client::{NutClient, Ups, DEFAULT_PORT};
-use crate::config::{detect_conf_dir, NotifySettings, NutConfig, UpsmonSettings};
+use crate::config::{
+    detect_conf_dir, marker_value, strip_comment, tokenize, NotifySettings, NutConfig,
+    UpsmonSettings,
+};
 
 /// A `SHUTDOWNCMD` that can wedge on a stuck array unmount because it carries no
 /// force-unmount safety net — the exact failure mode this plan exists to fix.
@@ -37,7 +40,17 @@ fn shutdown_cmd_unsafe(cmd: &str) -> bool {
 /// so nothing here re-enters `block_on`.
 pub async fn diagnose_typed(_args: DiagnoseArgs) -> Vec<Finding> {
     let dir = detect_conf_dir();
-    let upsmon = read_upsmon(&dir);
+    let mut findings: Vec<Finding> = Vec::new();
+    let upsmon = read_upsmon(&dir).unwrap_or_else(|e| {
+        findings.push(finding(
+            "upsmon-conf",
+            Severity::Crit,
+            "upsmon.conf does not parse",
+            format!("{e}; fix it by hand before orca can check or repair it"),
+            None,
+        ));
+        None
+    });
     let upssched = fs::read_to_string(dir.join("upssched.conf")).unwrap_or_default();
     let ups_conf = fs::read_to_string(dir.join("ups.conf")).unwrap_or_default();
     // A `ups-comms` finding is only meaningful when this host is a NUT server
@@ -54,7 +67,6 @@ pub async fn diagnose_typed(_args: DiagnoseArgs) -> Vec<Finding> {
         .and_then(|r| r.as_ref().ok())
         .and_then(|upses| upses.iter().find_map(|u| u.battery_runtime()));
 
-    let mut findings: Vec<Finding> = Vec::new();
     findings.extend(check_apcupsd_active());
     if needs_comms {
         // `probe` is `Some` whenever `needs_comms` is true.
@@ -391,16 +403,12 @@ pub fn repair_typed(args: RepairArgs) -> RepairOutcome {
         "battery-thresholds" => repair_write_config("safe battery thresholds"),
         "kill-power" => repair_kill_power(),
         "shutdown-command" => repair_write_config("completing, force-unmount-aware SHUTDOWNCMD"),
-        "persistent-event-log" => repair_upssched_config(
-            &detect_conf_dir(),
-            "persistent + remote event logging",
-            args.confirm,
-        ),
-        "onbattery-capture" => repair_upssched_config(
-            &detect_conf_dir(),
-            "on-battery diagnostics capture hook",
-            args.confirm,
-        ),
+        "persistent-event-log" => {
+            repair_upssched_config(&detect_conf_dir(), "persistent + remote event logging")
+        }
+        "onbattery-capture" => {
+            repair_upssched_config(&detect_conf_dir(), "on-battery diagnostics capture hook")
+        }
         "apcupsd-active" => repair_apcupsd_migrate(),
         other => (false, format!("nut has no in-place repair '{other}'")),
     };
@@ -420,25 +428,31 @@ fn repair_write_config(what: &str) -> (bool, String) {
     let dir = detect_conf_dir();
     // Merge the desired safe settings onto whatever is already configured so we
     // don't clobber an operator's UPS/monitor topology.
-    write_config(&dir, what, merged_safe_config(&dir))
+    match merged_safe_config(&dir) {
+        Ok(cfg) => write_config(&dir, what, cfg),
+        Err(e) => (false, format!("cannot apply {what}: {e}")),
+    }
 }
 
 /// A config repair whose fix lives in `upssched.conf`. A custom `upssched.conf`
-/// is kept verbatim, so the repair cannot succeed unless the caller opts in to
-/// replacing it (`replace_custom_upssched`, carried by the repair's `confirm`).
-fn repair_upssched_config(dir: &Path, what: &str, replace_custom_upssched: bool) -> (bool, String) {
-    let mut cfg = merged_safe_config(dir);
-    if cfg.upssched_custom.is_some() && !replace_custom_upssched {
+/// is kept verbatim, so the repair refuses; replacing it is an explicit
+/// `service.configure nut` with `replace_custom_upssched`.
+fn repair_upssched_config(dir: &Path, what: &str) -> (bool, String) {
+    let cfg = match merged_safe_config(dir) {
+        Ok(cfg) => cfg,
+        Err(e) => return (false, format!("cannot apply {what}: {e}")),
+    };
+    if cfg.upssched_custom.is_some() {
         return (
             false,
             format!(
                 "cannot apply {what}: a custom upssched.conf is in place in {} and was left \
-                 unchanged; rerun with confirm=true to replace it with the managed one",
+                 unchanged; to replace it with the managed one, run service.configure nut \
+                 with replace_custom_upssched: true",
                 dir.display()
             ),
         );
     }
-    cfg.replace_custom_upssched = replace_custom_upssched;
     write_config(dir, what, cfg)
 }
 
@@ -532,8 +546,8 @@ fn repair_apcupsd_migrate() -> (bool, String) {
 /// Build a `NutConfig` that merges orca's safe defaults onto whatever monitor
 /// topology is already present, so the config-writing repairs don't discard an
 /// operator's UPS/monitor setup while still enforcing the safe values.
-fn merged_safe_config(dir: &Path) -> NutConfig {
-    let mut cfg = NutConfig::read_existing(dir);
+fn merged_safe_config(dir: &Path) -> Result<NutConfig, String> {
+    let mut cfg = NutConfig::read_existing(dir)?;
     // Intentional: the safe-config repairs always enforce kill-power; turning it
     // off is a deliberate ups config_set, not a repair.
     cfg.upsmon.kill_power = true;
@@ -545,68 +559,57 @@ fn merged_safe_config(dir: &Path) -> NutConfig {
     if shutdown_cmd_unsafe(&cfg.upsmon.shutdown_cmd) {
         cfg.upsmon.shutdown_cmd = UpsmonSettings::default().shutdown_cmd;
     }
-    cfg.notify = NotifySettings::default();
-    cfg
+    // Event records must land on flash to survive the power-cycle.
+    if !cfg.notify.log_path.contains("/boot") {
+        cfg.notify.log_path = NotifySettings::default().log_path;
+    }
+    Ok(cfg)
 }
 
-/// Parse `upsmon.conf` into the fields the checks read. Returns `None` when the
-/// file is absent (NUT not set up as a monitor here).
-pub(crate) fn read_upsmon(dir: &Path) -> Option<UpsmonSettings> {
-    let text = fs::read_to_string(dir.join("upsmon.conf")).ok()?;
+/// Parse `upsmon.conf` into the fields the checks read. `Ok(None)` when the
+/// file is absent (NUT not set up as a monitor here); `Err` when a modelled
+/// setting is present but does not parse, so callers never act on a default.
+pub(crate) fn read_upsmon(dir: &Path) -> Result<Option<UpsmonSettings>, String> {
+    let Ok(text) = fs::read_to_string(dir.join("upsmon.conf")) else {
+        return Ok(None);
+    };
     let mut s = UpsmonSettings::default();
     let mut saw_flag = false;
     for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
+        let f = tokenize(line);
+        let Some(key) = f.first().map(String::as_str) else {
+            continue;
+        };
+        if !matches!(
+            key,
+            "MINSUPPLIES" | "SHUTDOWNCMD" | "POWERDOWNFLAG" | "HOSTSYNC" | "DEADTIME"
+        ) {
             continue;
         }
-        let (key, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
-        let rest = rest.trim();
+        let bad = || {
+            format!(
+                "cannot parse upsmon.conf line `{}`",
+                strip_comment(line).trim()
+            )
+        };
+        let [_, value] = f.as_slice() else {
+            return Err(bad());
+        };
+        let num = || value.parse::<u32>().map_err(|_| bad());
         match key {
-            "MINSUPPLIES" => {
-                if let Ok(v) = rest.parse() {
-                    s.min_supplies = v;
-                }
-            }
-            "SHUTDOWNCMD" => s.shutdown_cmd = unquote_field(rest),
+            "MINSUPPLIES" => s.min_supplies = num()?,
+            "SHUTDOWNCMD" => s.shutdown_cmd = value.clone(),
             "POWERDOWNFLAG" => {
-                s.power_down_flag = rest.to_string();
+                s.power_down_flag = value.clone();
                 saw_flag = true;
             }
-            "HOSTSYNC" => {
-                if let Ok(v) = rest.parse() {
-                    s.host_sync = v;
-                }
-            }
-            "DEADTIME" => {
-                if let Ok(v) = rest.parse() {
-                    s.dead_time = v;
-                }
-            }
-            _ => {}
+            "HOSTSYNC" => s.host_sync = num()?,
+            _ => s.dead_time = num()?,
         }
     }
     // kill_power is on only when a POWERDOWNFLAG is actually declared.
     s.kill_power = saw_flag;
-    Some(s)
-}
-
-/// Read the value of an `# orca-<key> <value>` marker comment the managed
-/// `upssched.conf` embeds (the handler's single source of truth).
-fn marker_value(upssched: &str, key: &str) -> Option<String> {
-    let prefix = format!("# {key} ");
-    upssched
-        .lines()
-        .find_map(|l| l.trim_start().strip_prefix(&prefix))
-        .map(|v| v.trim().to_string())
-}
-
-fn unquote_field(s: &str) -> String {
-    s.trim()
-        .strip_prefix('"')
-        .and_then(|s| s.strip_suffix('"'))
-        .unwrap_or(s.trim())
-        .to_string()
+    Ok(Some(s))
 }
 
 fn ups_comms_summary(upses: &[Ups]) -> String {
@@ -693,7 +696,7 @@ DEADTIME 15
     #[test]
     fn parses_upsmon_fixture() {
         let dir = write_upsmon(UPSMON_UNSAFE);
-        let s = read_upsmon(dir.path()).expect("parsed");
+        let s = read_upsmon(dir.path()).unwrap().expect("parsed");
         assert_eq!(s.min_supplies, 0);
         assert_eq!(s.shutdown_cmd, "poweroff");
         assert!(!s.kill_power, "no POWERDOWNFLAG → kill_power off");
@@ -701,7 +704,7 @@ DEADTIME 15
 
     #[test]
     fn battery_thresholds_flags_minsupplies_zero() {
-        let s = read_upsmon(write_upsmon(UPSMON_UNSAFE).path());
+        let s = read_upsmon(write_upsmon(UPSMON_UNSAFE).path()).unwrap();
         let f = check_battery_thresholds(&s, None).expect("finding");
         assert_eq!(f.severity, Severity::Warn);
         assert_eq!(f.id, "battery-thresholds");
@@ -710,7 +713,7 @@ DEADTIME 15
 
     #[test]
     fn battery_thresholds_ok_when_safe() {
-        let s = read_upsmon(write_upsmon(UPSMON_SAFE).path());
+        let s = read_upsmon(write_upsmon(UPSMON_SAFE).path()).unwrap();
         let f = check_battery_thresholds(&s, None).expect("finding");
         // No live upsd in the test env, so it only checks MINSUPPLIES here.
         assert_eq!(f.severity, Severity::Ok);
@@ -719,7 +722,7 @@ DEADTIME 15
 
     #[test]
     fn kill_power_warns_without_flag() {
-        let s = read_upsmon(write_upsmon(UPSMON_UNSAFE).path());
+        let s = read_upsmon(write_upsmon(UPSMON_UNSAFE).path()).unwrap();
         let f = check_kill_power(&s).expect("finding");
         assert_eq!(f.severity, Severity::Warn);
         assert!(f.repair.is_some());
@@ -727,7 +730,7 @@ DEADTIME 15
 
     #[test]
     fn kill_power_ok_with_flag() {
-        let s = read_upsmon(write_upsmon(UPSMON_SAFE).path());
+        let s = read_upsmon(write_upsmon(UPSMON_SAFE).path()).unwrap();
         let f = check_kill_power(&s).expect("finding");
         assert_eq!(f.severity, Severity::Ok);
         assert!(f.repair.is_none());
@@ -735,7 +738,7 @@ DEADTIME 15
 
     #[test]
     fn shutdown_command_warns_with_in_place_repair() {
-        let s = read_upsmon(write_upsmon(UPSMON_UNSAFE).path());
+        let s = read_upsmon(write_upsmon(UPSMON_UNSAFE).path()).unwrap();
         let f = check_shutdown_command(&s).expect("finding");
         assert_eq!(f.severity, Severity::Warn);
         let repair = f.repair.expect("repair");
@@ -749,16 +752,16 @@ DEADTIME 15
 
     #[test]
     fn safe_config_rewrites_unsafe_shutdown_cmd() {
-        let s = read_upsmon(write_upsmon(UPSMON_UNSAFE).path());
+        let s = read_upsmon(write_upsmon(UPSMON_UNSAFE).path()).unwrap();
         assert!(shutdown_cmd_unsafe(&s.as_ref().unwrap().shutdown_cmd));
         let dir = write_upsmon(UPSMON_UNSAFE);
-        let cfg = merged_safe_config(dir.path());
+        let cfg = merged_safe_config(dir.path()).unwrap();
         assert!(!shutdown_cmd_unsafe(&cfg.upsmon.shutdown_cmd));
     }
 
     #[test]
     fn shutdown_command_ok_with_completing_cmd() {
-        let s = read_upsmon(write_upsmon(UPSMON_SAFE).path());
+        let s = read_upsmon(write_upsmon(UPSMON_SAFE).path()).unwrap();
         let f = check_shutdown_command(&s).expect("finding");
         assert_eq!(f.severity, Severity::Ok);
         assert!(f.repair.is_none());
@@ -766,7 +769,7 @@ DEADTIME 15
 
     #[test]
     fn persistent_event_log_warns_when_missing() {
-        let s = read_upsmon(write_upsmon(UPSMON_SAFE).path());
+        let s = read_upsmon(write_upsmon(UPSMON_SAFE).path()).unwrap();
         let f = check_persistent_event_log(&s, "").expect("finding");
         assert_eq!(f.severity, Severity::Warn);
         assert_eq!(f.id, "persistent-event-log");
@@ -782,7 +785,7 @@ DEADTIME 15
             .find(|f| f.name == "upssched.conf")
             .unwrap()
             .contents;
-        let s = read_upsmon(write_upsmon(UPSMON_SAFE).path());
+        let s = read_upsmon(write_upsmon(UPSMON_SAFE).path()).unwrap();
         let f = check_persistent_event_log(&s, &rendered).expect("finding");
         assert_eq!(f.severity, Severity::Ok);
     }
@@ -819,7 +822,7 @@ DEADTIME 15
     }
 
     #[test]
-    fn upssched_repairs_refuse_custom_upssched_without_opt_in() {
+    fn upssched_repairs_refuse_custom_upssched() {
         let dir = tempfile::tempdir().unwrap();
         let custom = "CMDSCRIPT /usr/bin/custom\n";
         std::fs::write(dir.path().join("upssched.conf"), custom).unwrap();
@@ -829,14 +832,69 @@ DEADTIME 15
         )
         .unwrap();
         for what in ["persistent + remote event logging", "on-battery capture"] {
-            let (ok, msg) = repair_upssched_config(dir.path(), what, false);
+            let (ok, msg) = repair_upssched_config(dir.path(), what);
             assert!(!ok);
-            assert!(msg.contains("custom upssched.conf"), "{msg}");
+            assert!(msg.contains("replace_custom_upssched: true"), "{msg}");
         }
         assert_eq!(
             std::fs::read_to_string(dir.path().join("upssched.conf")).unwrap(),
             custom
         );
+    }
+
+    #[test]
+    fn upsmon_trailing_comments_parse() {
+        let dir = write_upsmon(
+            "MINSUPPLIES 2 # two PSUs\nSHUTDOWNCMD \"/sbin/shutdown -h +0\" # safe\n\
+             # SHUTDOWNCMD halt\nHOSTSYNC 20 # sync\n",
+        );
+        let s = read_upsmon(dir.path()).unwrap().unwrap();
+        assert_eq!(s.min_supplies, 2);
+        assert_eq!(s.shutdown_cmd, "/sbin/shutdown -h +0");
+        assert_eq!(s.host_sync, 20);
+    }
+
+    #[test]
+    fn unparseable_upsmon_setting_fails_closed() {
+        for bad in [
+            "MINSUPPLIES two\n",
+            "MINSUPPLIES\n",
+            "HOSTSYNC 1 2\n",
+            "DEADTIME -5\n",
+            "SHUTDOWNCMD /sbin/shutdown -h +0\n",
+        ] {
+            let dir = write_upsmon(bad);
+            assert!(read_upsmon(dir.path()).is_err(), "{bad}");
+            assert!(merged_safe_config(dir.path()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn safe_config_keeps_notify_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = NutConfig {
+            upses: vec![crate::config::UpsDef {
+                name: "serverups".into(),
+                driver: "usbhid-ups".into(),
+                port: "auto".into(),
+                ..Default::default()
+            }],
+            monitors: vec![crate::config::MonitorDef {
+                system: "serverups@localhost".into(),
+                power_value: 1,
+                username: "u".into(),
+                password: "p".into(),
+                role: "master".into(),
+            }],
+            ..Default::default()
+        };
+        cfg.notify.notify_cmd = "/usr/local/bin/mine".into();
+        cfg.notify.remote_syslog = "10.0.0.9:514".into();
+        for f in cfg.render() {
+            fs::write(dir.path().join(f.name), f.contents).unwrap();
+        }
+        let merged = merged_safe_config(dir.path()).unwrap();
+        assert_eq!(merged.notify, cfg.notify);
     }
 
     #[tokio::test]

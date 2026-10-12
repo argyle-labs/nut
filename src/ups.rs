@@ -56,21 +56,21 @@ pub async fn state_typed(args: UpsQueryArgs) -> Result<Vec<UpsState>, String> {
 /// `config_get` op — the power/shutdown knobs nut manages (kill-power +
 /// SHUTDOWNCMD). Threshold fields are apcupsd-shaped and left `None` here; the
 /// unraid provider fills those for Unraid hosts.
-pub fn config_get_typed(args: UpsQueryArgs) -> Vec<UpsConfig> {
+pub fn config_get_typed(args: UpsQueryArgs) -> Result<Vec<UpsConfig>, String> {
     let dir = detect_conf_dir();
-    let upsmon = crate::checks::read_upsmon(&dir).unwrap_or_default();
+    let upsmon = crate::checks::read_upsmon(&dir)?.unwrap_or_default();
     let id = args.id.unwrap_or_else(|| "default".to_string());
-    vec![UpsConfig {
+    Ok(vec![UpsConfig {
         id,
         kill_power: Some(upsmon.kill_power),
         shutdown_cmd: (!upsmon.shutdown_cmd.trim().is_empty()).then(|| upsmon.shutdown_cmd.clone()),
         ..Default::default()
-    }]
+    }])
 }
 
 /// The on-disk config with `cfg`'s kill-power / SHUTDOWNCMD applied.
-fn merged_config(dir: &std::path::Path, cfg: &UpsConfig) -> NutConfig {
-    let mut nut = NutConfig::read_existing(dir);
+fn merged_config(dir: &std::path::Path, cfg: &UpsConfig) -> Result<NutConfig, String> {
+    let mut nut = NutConfig::read_existing(dir)?;
     if let Some(k) = cfg.kill_power {
         nut.upsmon.kill_power = k;
     }
@@ -79,7 +79,7 @@ fn merged_config(dir: &std::path::Path, cfg: &UpsConfig) -> NutConfig {
             nut.upsmon.shutdown_cmd = s.clone();
         }
     }
-    nut
+    Ok(nut)
 }
 
 /// `config_set` op — apply kill-power / SHUTDOWNCMD onto upsmon.conf idempotently,
@@ -87,8 +87,7 @@ fn merged_config(dir: &std::path::Path, cfg: &UpsConfig) -> NutConfig {
 /// topology is preserved.
 pub fn config_set_typed(cfg: UpsConfig) -> UpsConfigOutcome {
     let dir = detect_conf_dir();
-    let nut = merged_config(&dir, &cfg);
-    match nut.apply(&dir) {
+    match merged_config(&dir, &cfg).and_then(|nut| nut.apply(&dir)) {
         Ok(out) if out.written.is_empty() => UpsConfigOutcome {
             id: cfg.id,
             provider: crate::PROVIDER.to_string(),
@@ -128,7 +127,7 @@ mod tests {
     #[test]
     fn config_get_reports_kill_power_default() {
         // No config dir → defaults; kill_power is always reported (Some).
-        let cfgs = config_get_typed(UpsQueryArgs::default());
+        let cfgs = config_get_typed(UpsQueryArgs::default()).unwrap();
         assert!(cfgs.iter().any(|c| c.kill_power.is_some()));
     }
 
@@ -152,12 +151,67 @@ mod tests {
                 shutdown_cmd: Some("/sbin/shutdown -h +0".into()),
                 ..Default::default()
             },
-        );
+        )
+        .unwrap();
         assert_eq!(nut.upses.len(), 1);
         assert_eq!(nut.upses[0].name, "serverups");
         assert_eq!(nut.listen.len(), 1);
         assert_eq!(nut.monitors.len(), 1);
         assert_eq!(nut.upsmon.shutdown_cmd, "/sbin/shutdown -h +0");
+    }
+
+    #[test]
+    fn config_set_keeps_notifycmd_and_syslog_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut nut = NutConfig {
+            upses: vec![crate::config::UpsDef {
+                name: "serverups".into(),
+                driver: "usbhid-ups".into(),
+                port: "auto".into(),
+                ..Default::default()
+            }],
+            monitors: vec![crate::config::MonitorDef {
+                system: "serverups@localhost".into(),
+                power_value: 1,
+                username: "u".into(),
+                password: "p".into(),
+                role: "master".into(),
+            }],
+            ..Default::default()
+        };
+        nut.notify.notify_cmd = "/usr/local/bin/mine".into();
+        nut.notify.remote_syslog = "10.0.0.9:514".into();
+        for f in nut.render() {
+            std::fs::write(dir.path().join(f.name), f.contents).unwrap();
+        }
+        let before = |n: &str| std::fs::read_to_string(dir.path().join(n)).unwrap();
+        let (mon, sched) = (before("upsmon.conf"), before("upssched.conf"));
+        let merged = merged_config(
+            dir.path(),
+            &UpsConfig {
+                kill_power: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        struct NoRestart;
+        impl crate::config::ServiceControl for NoRestart {
+            fn restart(&self, _: bool) -> crate::config::Restart {
+                crate::config::Restart::Done(vec![])
+            }
+        }
+        let out = merged
+            .apply_with(dir.path(), &NoRestart, std::path::Path::new("/nonexistent"))
+            .unwrap();
+        assert_eq!(out.written, vec!["upsmon.conf"]);
+        let mon_after = before("upsmon.conf");
+        assert!(
+            mon_after.contains("NOTIFYCMD /usr/local/bin/mine"),
+            "{mon_after}"
+        );
+        assert_ne!(mon_after, mon);
+        assert_eq!(before("upssched.conf"), sched);
+        assert!(sched.contains("# orca-remote-syslog 10.0.0.9:514"));
     }
 
     #[test]

@@ -54,7 +54,9 @@ impl UpsProvider for NutUps {
     }
 
     fn config_get(&self, args: UpsQueryArgs) -> BoxFuture<'_, Result<Vec<UpsConfig>>> {
-        Box::pin(async move { Ok(crate::ups::config_get_typed(args)) })
+        Box::pin(async move {
+            crate::ups::config_get_typed(args).map_err(|e| plugin_toolkit::anyhow::anyhow!(e))
+        })
     }
 
     fn config_set(&self, config: UpsConfig) -> BoxFuture<'_, Result<UpsConfigOutcome>> {

@@ -43,7 +43,7 @@ pub struct NutConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remove_upses: Vec<String>,
     /// On-disk `MONITOR` systems (`ups@host`) the caller intends to drop. Apply
-    /// refuses to shrink the MONITOR count by more than these.
+    /// refuses to drop any on-disk system not listed here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remove_monitors: Vec<String>,
     /// Unmodelled `ups.conf` global lines (before the first section), kept verbatim.
@@ -55,6 +55,10 @@ pub struct NutConfig {
     /// Unmodelled `upsmon.conf` lines, kept verbatim.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub upsmon_extra: Vec<String>,
+    /// Operator `NOTIFYFLAG` flags for the managed events, merged onto ours as
+    /// `(event, "FLAG+FLAG")`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notify_flags: Vec<(String, String)>,
     /// An operator-written `upssched.conf`, kept verbatim instead of the managed one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upssched_custom: Option<String>,
@@ -71,8 +75,8 @@ pub struct UpsDef {
     pub port: String,
     #[serde(default)]
     pub description: String,
-    /// Extra driver options rendered verbatim as `key = value` lines; an empty
-    /// value renders as a bare flag (`nolock`).
+    /// Extra driver options rendered as `key = value` lines; an empty value
+    /// renders the key alone (a bare flag like `nolock`, or a `#` comment line).
     #[serde(default)]
     pub extra: Vec<(String, String)>,
 }
@@ -189,6 +193,8 @@ const MANAGED_EVENTS: [&str; 6] = [
     "ONLINE", "ONBATT", "LOWBATT", "COMMBAD", "COMMOK", "SHUTDOWN",
 ];
 
+const MANAGED_FLAGS: [&str; 3] = ["SYSLOG", "WALL", "EXEC"];
+
 /// The default config directory NUT reads on most Linux hosts.
 pub const DEFAULT_CONF_DIR: &str = "/etc/nut";
 
@@ -201,26 +207,30 @@ pub struct RenderedFile {
 
 impl NutConfig {
     /// The topology and settings currently on disk in `dir`; missing files
-    /// read as empty. `notify` is left at its default; unmodelled lines are
-    /// carried as passthrough so applying the result loses nothing.
-    pub fn read_existing(dir: &Path) -> Self {
+    /// read as empty. Unmodelled lines and comment lines are carried as
+    /// passthrough; only trailing comments on modelled lines (`MONITOR`,
+    /// `LISTEN`, `[section]`, `driver = …`) are dropped. A modelled value that
+    /// does not parse is an error rather than a silent default.
+    pub fn read_existing(dir: &Path) -> Result<Self, String> {
         let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap_or_default();
         let ups = read("ups.conf");
         let upsd = read("upsd.conf");
         let upsmon = read("upsmon.conf");
         let upssched = read("upssched.conf");
-        Self {
-            upses: parse_ups_conf(&ups),
-            listen: parse_upsd_conf(&upsd),
+        let managed_sched = upssched.starts_with(MANAGED_HEADER);
+        Ok(Self {
+            upses: parse_ups_conf(&ups)?,
+            listen: parse_upsd_conf(&upsd)?,
             monitors: parse_monitors(&upsmon),
-            upsmon: crate::checks::read_upsmon(dir).unwrap_or_default(),
+            upsmon: crate::checks::read_upsmon(dir)?.unwrap_or_default(),
+            notify: parse_notify(&upsmon, managed_sched.then_some(upssched.as_str()))?,
             ups_globals: parse_ups_globals(&ups),
             upsd_extra: parse_upsd_extra(&upsd),
             upsmon_extra: parse_upsmon_extra(&upsmon),
-            upssched_custom: (!upssched.trim().is_empty() && !upssched.starts_with(MANAGED_HEADER))
-                .then_some(upssched),
+            notify_flags: parse_notify_flags(&upsmon),
+            upssched_custom: (!upssched.trim().is_empty() && !managed_sched).then_some(upssched),
             ..Default::default()
-        }
+        })
     }
 
     /// Render all four config files deterministically.
@@ -270,8 +280,20 @@ impl NutConfig {
                     .to_string(),
             );
         }
+        let incomplete: Vec<&str> = self
+            .upses
+            .iter()
+            .filter(|u| u.driver.trim().is_empty() || u.port.trim().is_empty())
+            .map(|u| u.name.as_str())
+            .collect();
+        if !incomplete.is_empty() {
+            return Err(format!(
+                "refusing to apply: UPS {} has no driver or port",
+                incomplete.join(", ")
+            ));
+        }
         let ups_text = std::fs::read_to_string(dir.join("ups.conf")).unwrap_or_default();
-        let on_disk = parse_ups_conf(&ups_text);
+        let on_disk = parse_ups_conf(&ups_text).map_err(|e| format!("refusing to apply: {e}"))?;
         let raw_sections = ups_text
             .lines()
             .filter(|l| strip_comment(l).trim().starts_with('['))
@@ -290,7 +312,18 @@ impl NutConfig {
             .filter(|t| t.first().is_some_and(|t| t == "MONITOR"))
             .map(|t| t.get(1).cloned().unwrap_or_default())
             .collect();
-        let raw_monitors = disk_monitors.len();
+        let both: Vec<&str> = self
+            .monitors
+            .iter()
+            .map(|m| m.system.as_str())
+            .filter(|s| self.remove_monitors.iter().any(|r| r == s))
+            .collect();
+        if !both.is_empty() {
+            return Err(format!(
+                "refusing to apply: {} is in both monitors and remove_monitors",
+                both.join(", ")
+            ));
+        }
         let unknown_monitors: Vec<&str> = self
             .remove_monitors
             .iter()
@@ -303,11 +336,17 @@ impl NutConfig {
                 unknown_monitors.join(", ")
             ));
         }
-        if raw_monitors > self.monitors.len() + self.remove_monitors.len() {
+        let dropped_monitors: Vec<&str> = disk_monitors
+            .iter()
+            .map(String::as_str)
+            .filter(|d| !self.monitors.iter().any(|m| m.system == *d))
+            .filter(|d| !self.remove_monitors.iter().any(|r| r == d))
+            .collect();
+        if !dropped_monitors.is_empty() {
             return Err(format!(
-                "refusing to apply: upsmon.conf has {raw_monitors} MONITOR lines but the \
-                 config carries only {}; list dropped ones in remove_monitors",
-                self.monitors.len()
+                "refusing to apply: it would drop MONITOR {} from upsmon.conf; list them in \
+                 remove_monitors to remove them",
+                dropped_monitors.join(", ")
             ));
         }
         let missing_local: Vec<&str> = self
@@ -439,16 +478,16 @@ impl NutConfig {
         }
         for ups in &self.upses {
             out.push_str(&format!("\n[{}]\n", ups.name));
-            out.push_str(&format!("    driver = {}\n", ups.driver));
-            out.push_str(&format!("    port = {}\n", ups.port));
+            out.push_str(&format!("    driver = {}\n", quote_token(&ups.driver)));
+            out.push_str(&format!("    port = {}\n", quote_token(&ups.port)));
             if !ups.description.is_empty() {
-                out.push_str(&format!("    desc = \"{}\"\n", ups.description));
+                out.push_str(&format!("    desc = {}\n", quote_token(&ups.description)));
             }
             for (k, v) in &ups.extra {
                 if v.is_empty() {
                     out.push_str(&format!("    {k}\n"));
                 } else {
-                    out.push_str(&format!("    {k} = {v}\n"));
+                    out.push_str(&format!("    {k} = {}\n", quote_token(v)));
                 }
             }
         }
@@ -492,9 +531,14 @@ impl NutConfig {
         out.push_str(&format!("HOSTSYNC {}\n", s.host_sync));
         out.push_str(&format!("DEADTIME {}\n", s.dead_time));
         // Route every event through upssched so logging + capture run.
-        out.push_str(&format!("NOTIFYCMD {}\n", n.notify_cmd));
-        for flag in MANAGED_EVENTS {
-            out.push_str(&format!("NOTIFYFLAG {flag} SYSLOG+WALL+EXEC\n"));
+        out.push_str(&format!("NOTIFYCMD {}\n", quote_token(&n.notify_cmd)));
+        for event in MANAGED_EVENTS {
+            let mut flags = MANAGED_FLAGS.join("+");
+            for (_, extra) in self.notify_flags.iter().filter(|(e, _)| e == event) {
+                flags.push('+');
+                flags.push_str(extra);
+            }
+            out.push_str(&format!("NOTIFYFLAG {event} {flags}\n"));
         }
         for line in &self.upsmon_extra {
             out.push_str(&format!("{line}\n"));
@@ -890,7 +934,7 @@ fn sweep_stale_temps(dir: &Path, files: &[RenderedFile]) {
 }
 
 /// `line` with any `#` comment outside double quotes removed.
-fn strip_comment(line: &str) -> &str {
+pub(crate) fn strip_comment(line: &str) -> &str {
     let (mut quoted, mut escaped) = (false, false);
     for (i, c) in line.char_indices() {
         match c {
@@ -905,7 +949,7 @@ fn strip_comment(line: &str) -> &str {
 }
 
 /// NUT-style tokens: whitespace-separated, `"..."` groups, `\` escapes, `#` comments.
-fn tokenize(line: &str) -> Vec<String> {
+pub(crate) fn tokenize(line: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut cur: Option<String> = None;
     let (mut quoted, mut chars) = (false, line.chars());
@@ -937,17 +981,27 @@ fn quote_token(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-/// Non-comment lines of `text`, comment-stripped and trimmed.
-fn content_lines(text: &str) -> impl Iterator<Item = &str> {
+/// Non-blank lines of `text`, trimmed, comments kept, minus the managed header.
+fn raw_lines(text: &str) -> impl Iterator<Item = &str> {
     text.lines()
-        .map(|l| strip_comment(l).trim())
-        .filter(|l| !l.is_empty())
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && *l != MANAGED_HEADER.trim_end())
+}
+
+/// The single NUT token in `v`, or an error naming `what`.
+fn one_token(v: &str, what: &str) -> Result<String, String> {
+    match tokenize(v).as_slice() {
+        [t] => Ok(t.clone()),
+        _ => Err(format!("cannot parse {what} value `{}`", v.trim())),
+    }
 }
 
 /// `[name]` sections of `ups.conf`; global directives are in [`parse_ups_globals`].
-fn parse_ups_conf(text: &str) -> Vec<UpsDef> {
+/// Comment lines inside a section are kept as bare `extra` keys.
+fn parse_ups_conf(text: &str) -> Result<Vec<UpsDef>, String> {
     let mut upses: Vec<UpsDef> = Vec::new();
-    for line in content_lines(text) {
+    for raw in raw_lines(text) {
+        let line = strip_comment(raw).trim();
         if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
             upses.push(UpsDef {
                 name: name.trim().to_string(),
@@ -958,40 +1012,65 @@ fn parse_ups_conf(text: &str) -> Vec<UpsDef> {
         let Some(ups) = upses.last_mut() else {
             continue;
         };
-        let (k, v) = line.split_once('=').unwrap_or((line, ""));
-        let (k, v) = (k.trim(), v.trim());
+        if line.is_empty() {
+            ups.extra.push((raw.to_string(), String::new()));
+            continue;
+        }
+        let what = format!("ups.conf [{}]", ups.name);
+        let (k, v) = match line.split_once('=') {
+            Some((k, v)) => (k.trim(), one_token(v, &format!("{what} {}", k.trim()))?),
+            None => (line, String::new()),
+        };
+        if k.is_empty() || k.contains(char::is_whitespace) {
+            return Err(format!("cannot parse {what} line `{line}`"));
+        }
         match k {
-            "driver" => ups.driver = v.to_string(),
-            "port" => ups.port = v.to_string(),
-            "desc" => ups.description = v.trim_matches('"').to_string(),
-            _ => ups.extra.push((k.to_string(), v.to_string())),
+            "driver" => ups.driver = v,
+            "port" => ups.port = v,
+            "desc" => ups.description = v,
+            _ => ups.extra.push((k.to_string(), v)),
         }
     }
-    upses
+    if let Some(u) = upses
+        .iter()
+        .find(|u| u.driver.is_empty() || u.port.is_empty())
+    {
+        return Err(format!("ups.conf [{}] has no driver or port", u.name));
+    }
+    Ok(upses)
 }
 
 fn parse_ups_globals(text: &str) -> Vec<String> {
-    content_lines(text)
-        .take_while(|l| !l.starts_with('['))
+    raw_lines(text)
+        .take_while(|l| !strip_comment(l).trim().starts_with('['))
         .map(str::to_string)
         .collect()
 }
 
-fn parse_upsd_conf(text: &str) -> Vec<ListenDef> {
-    text.lines()
-        .filter_map(|l| {
-            let f = tokenize(l);
-            (f.first()? == "LISTEN").then_some(())?;
-            Some(ListenDef {
-                address: f.get(1)?.clone(),
-                port: f.get(2).and_then(|p| p.parse().ok()),
-            })
-        })
-        .collect()
+fn parse_upsd_conf(text: &str) -> Result<Vec<ListenDef>, String> {
+    let mut listen = Vec::new();
+    for l in text.lines() {
+        let f = tokenize(l);
+        if f.first().map(String::as_str) != Some("LISTEN") {
+            continue;
+        }
+        let (address, port) = match f.as_slice() {
+            [_, a] => (a.clone(), None),
+            [_, a, p] => {
+                let port = p
+                    .parse()
+                    .map_err(|_| format!("upsd.conf LISTEN {a} has a non-numeric port `{p}`"))?;
+                (a.clone(), Some(port))
+            }
+            _ => return Err(format!("cannot parse upsd.conf line `{}`", l.trim())),
+        };
+        listen.push(ListenDef { address, port });
+    }
+    Ok(listen)
 }
 
 fn parse_upsd_extra(text: &str) -> Vec<String> {
-    content_lines(text)
+    raw_lines(text)
         .filter(|l| tokenize(l).first().map(String::as_str) != Some("LISTEN"))
         .map(str::to_string)
         .collect()
@@ -1017,7 +1096,7 @@ fn parse_monitors(text: &str) -> Vec<MonitorDef> {
 
 /// `upsmon.conf` lines [`NutConfig::render_upsmon_conf`] does not itself emit.
 fn parse_upsmon_extra(text: &str) -> Vec<String> {
-    content_lines(text)
+    raw_lines(text)
         .filter(|l| {
             let f = tokenize(l);
             match f.first().map(String::as_str) {
@@ -1033,6 +1112,71 @@ fn parse_upsmon_extra(text: &str) -> Vec<String> {
         })
         .map(str::to_string)
         .collect()
+}
+
+/// Operator flags on managed-event `NOTIFYFLAG` lines beyond [`MANAGED_FLAGS`].
+fn parse_notify_flags(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|l| {
+            let f = tokenize(l);
+            let [kw, event, flags] = f.as_slice() else {
+                return None;
+            };
+            if kw != "NOTIFYFLAG" || !MANAGED_EVENTS.contains(&event.as_str()) {
+                return None;
+            }
+            let extra: Vec<&str> = flags
+                .split('+')
+                .filter(|f| !f.is_empty() && !MANAGED_FLAGS.contains(f))
+                .collect();
+            (!extra.is_empty()).then(|| (event.clone(), extra.join("+")))
+        })
+        .collect()
+}
+
+/// [`NotifySettings`] from `upsmon.conf`'s `NOTIFYCMD` and, when orca manages
+/// it, `upssched.conf`'s `PIPEFN`/`LOCKFN` and `# orca-*` markers.
+fn parse_notify(upsmon: &str, managed_upssched: Option<&str>) -> Result<NotifySettings, String> {
+    let mut n = NotifySettings::default();
+    for l in upsmon.lines() {
+        let f = tokenize(l);
+        if f.first().map(String::as_str) == Some("NOTIFYCMD") {
+            let [_, cmd] = f.as_slice() else {
+                return Err(format!("cannot parse upsmon.conf line `{}`", l.trim()));
+            };
+            n.notify_cmd = cmd.clone();
+        }
+    }
+    let Some(sched) = managed_upssched else {
+        return Ok(n);
+    };
+    for l in sched.lines() {
+        match tokenize(l).as_slice() {
+            [k, v] if k == "PIPEFN" => n.pipe = v.clone(),
+            [k, v] if k == "LOCKFN" => n.lock = v.clone(),
+            _ => {}
+        }
+    }
+    for (key, field) in [
+        ("orca-log-path", &mut n.log_path),
+        ("orca-remote-syslog", &mut n.remote_syslog),
+        ("orca-onbattery-capture", &mut n.onbattery_capture_cmd),
+    ] {
+        if let Some(v) = marker_value(sched, key).filter(|v| !v.is_empty()) {
+            *field = v;
+        }
+    }
+    Ok(n)
+}
+
+/// Read the value of an `# orca-<key> <value>` marker comment the managed
+/// `upssched.conf` embeds (the handler's single source of truth).
+pub(crate) fn marker_value(upssched: &str, key: &str) -> Option<String> {
+    let prefix = format!("# {key} ");
+    upssched
+        .lines()
+        .find_map(|l| l.trim_start().strip_prefix(&prefix))
+        .map(|v| v.trim().to_string())
 }
 
 /// gid of the `nut` group from `group_file`, if present.
@@ -1488,6 +1632,7 @@ mod tests {
 
         let client = NutConfig {
             remove_upses: vec!["serverups".into()],
+            remove_monitors: vec!["serverups@localhost".into()],
             ..client
         };
         client.apply_with(dir.path(), &svc, &group).unwrap();
@@ -1502,7 +1647,7 @@ mod tests {
         cfg.upses[0].extra = vec![("pollinterval".into(), "5".into())];
         cfg.apply_with(dir.path(), &MockServices::default(), &group)
             .unwrap();
-        let read = NutConfig::read_existing(dir.path());
+        let read = NutConfig::read_existing(dir.path()).unwrap();
         assert_eq!(read, cfg);
     }
 
@@ -1557,7 +1702,7 @@ NOTIFYFLAG REPLBATT SYSLOG+WALL\n";
     fn full_config_round_trips_without_loss() {
         let (dir, group) = setup();
         write_full(dir.path());
-        let before = NutConfig::read_existing(dir.path());
+        let before = NutConfig::read_existing(dir.path()).unwrap();
         assert_eq!(before.upses.len(), 2);
         assert_eq!(before.monitors.len(), 2);
         assert_eq!(before.monitors[0].password, "pass with spaces");
@@ -1566,7 +1711,7 @@ NOTIFYFLAG REPLBATT SYSLOG+WALL\n";
             .contains(&("ignorelb".into(), String::new())));
         let svc = MockServices::default();
         before.apply_with(dir.path(), &svc, &group).unwrap();
-        let after = NutConfig::read_existing(dir.path());
+        let after = NutConfig::read_existing(dir.path()).unwrap();
         assert_eq!(after, before);
         for line in [
             "maxretry = 3",
@@ -1604,7 +1749,7 @@ NOTIFYFLAG REPLBATT SYSLOG+WALL\n";
     fn unparsed_monitor_or_section_is_refused() {
         let (dir, group) = setup();
         write_full(dir.path());
-        let mut cfg = NutConfig::read_existing(dir.path());
+        let mut cfg = NutConfig::read_existing(dir.path()).unwrap();
         cfg.monitors.pop();
         let err = cfg
             .apply_with(dir.path(), &MockServices::default(), &group)
@@ -1613,6 +1758,7 @@ NOTIFYFLAG REPLBATT SYSLOG+WALL\n";
 
         std::fs::write(dir.path().join("ups.conf"), format!("{FULL_UPS}[broken\n")).unwrap();
         let err = NutConfig::read_existing(dir.path())
+            .unwrap()
             .apply_with(dir.path(), &MockServices::default(), &group)
             .unwrap_err();
         assert!(err.contains("[section]"), "{err}");
@@ -1622,7 +1768,7 @@ NOTIFYFLAG REPLBATT SYSLOG+WALL\n";
     fn dropping_monitors_requires_remove_monitors() {
         let (dir, group) = setup();
         write_full(dir.path());
-        let mut cfg = NutConfig::read_existing(dir.path());
+        let mut cfg = NutConfig::read_existing(dir.path()).unwrap();
         let dropped = cfg.monitors.pop().unwrap().system;
         let err = cfg
             .apply_with(dir.path(), &MockServices::default(), &group)
@@ -1646,7 +1792,7 @@ NOTIFYFLAG REPLBATT SYSLOG+WALL\n";
     fn remove_monitors_cannot_empty_the_config() {
         let (dir, group) = setup();
         write_full(dir.path());
-        let mut cfg = NutConfig::read_existing(dir.path());
+        let mut cfg = NutConfig::read_existing(dir.path()).unwrap();
         cfg.remove_monitors = cfg.monitors.drain(..).map(|m| m.system).collect();
         let err = cfg
             .apply_with(dir.path(), &MockServices::default(), &group)
@@ -1714,5 +1860,114 @@ NOTIFYFLAG REPLBATT SYSLOG+WALL\n";
         assert!(unraid_gui_mode(root.path()).is_some());
         std::fs::write(&cfg, "MANUAL=\"disable\"\nMANUAL=\"enable\"\n").unwrap();
         assert!(unraid_gui_mode(root.path()).is_none());
+    }
+
+    #[test]
+    fn monitor_in_both_lists_is_refused() {
+        let (dir, group) = setup();
+        write_full(dir.path());
+        let mut cfg = NutConfig::read_existing(dir.path()).unwrap();
+        cfg.remove_monitors = vec![cfg.monitors[0].system.clone()];
+        let err = cfg
+            .apply_with(dir.path(), &MockServices::default(), &group)
+            .unwrap_err();
+        assert!(err.contains("both"), "{err}");
+    }
+
+    #[test]
+    fn swapped_monitor_name_is_refused() {
+        let (dir, group) = setup();
+        write_full(dir.path());
+        let mut cfg = NutConfig::read_existing(dir.path()).unwrap();
+        cfg.monitors[1].system = "serverups@127.0.0.1".into();
+        let err = cfg
+            .apply_with(dir.path(), &MockServices::default(), &group)
+            .unwrap_err();
+        assert!(err.contains("other@127.0.0.1"), "{err}");
+    }
+
+    #[test]
+    fn operator_notifyflags_merge_with_managed() {
+        let (dir, group) = setup();
+        write_full(dir.path());
+        let mon = dir.path().join("upsmon.conf");
+        let text = std::fs::read_to_string(&mon).unwrap() + "NOTIFYFLAG ONBATT SYSLOG+IGNORE\n";
+        std::fs::write(&mon, text).unwrap();
+        let cfg = NutConfig::read_existing(dir.path()).unwrap();
+        cfg.apply_with(dir.path(), &MockServices::default(), &group)
+            .unwrap();
+        let out = std::fs::read_to_string(&mon).unwrap();
+        assert!(
+            out.contains("NOTIFYFLAG ONBATT SYSLOG+WALL+EXEC+IGNORE\n"),
+            "{out}"
+        );
+        assert_eq!(NutConfig::read_existing(dir.path()).unwrap(), cfg);
+    }
+
+    #[test]
+    fn operator_comments_survive_apply() {
+        let (dir, group) = setup();
+        write_full(dir.path());
+        let add = |name: &str, line: &str| {
+            let p = dir.path().join(name);
+            let t = std::fs::read_to_string(&p).unwrap();
+            std::fs::write(&p, format!("{line}\n{t}")).unwrap();
+        };
+        add("upsmon.conf", "# upsmon note");
+        add("upsd.conf", "# upsd note");
+        add("ups.conf", "# ups note");
+        let ups = dir.path().join("ups.conf");
+        let t = std::fs::read_to_string(&ups).unwrap();
+        std::fs::write(
+            &ups,
+            t.replace("  nolock\n", "  nolock\n  # section note\n"),
+        )
+        .unwrap();
+        let cfg = NutConfig::read_existing(dir.path()).unwrap();
+        cfg.apply_with(dir.path(), &MockServices::default(), &group)
+            .unwrap();
+        for (name, line) in [
+            ("upsmon.conf", "# upsmon note"),
+            ("upsd.conf", "# upsd note"),
+            ("ups.conf", "# ups note"),
+            ("ups.conf", "# section note"),
+            ("ups.conf", "pollinterval = 2 # fast"),
+        ] {
+            let t = std::fs::read_to_string(dir.path().join(name)).unwrap();
+            assert!(t.contains(line), "{line}\n{t}");
+        }
+        assert_eq!(NutConfig::read_existing(dir.path()).unwrap(), cfg);
+    }
+
+    #[test]
+    fn ups_section_values_are_unquoted_and_validated() {
+        let ups =
+            parse_ups_conf("[u]\n driver = \"usbhid-ups\"\n port=auto\n desc = \"A \\\"b\\\"\"\n")
+                .unwrap();
+        assert_eq!(ups[0].driver, "usbhid-ups");
+        assert_eq!(ups[0].port, "auto");
+        assert_eq!(ups[0].description, "A \"b\"");
+        assert!(parse_ups_conf("[u]\n driver = usbhid-ups\n").is_err());
+        assert!(parse_ups_conf("[u]\n driver = a b\n port = auto\n").is_err());
+        let cfg = NutConfig {
+            upses: vec![UpsDef {
+                port: String::new(),
+                ..sample().upses[0].clone()
+            }],
+            ..sample()
+        };
+        let (dir, group) = setup();
+        let err = cfg
+            .apply_with(dir.path(), &MockServices::default(), &group)
+            .unwrap_err();
+        assert!(err.contains("no driver or port"), "{err}");
+    }
+
+    #[test]
+    fn non_numeric_listen_port_is_refused() {
+        assert!(parse_upsd_conf("LISTEN 0.0.0.0 nut\n").is_err());
+        let (dir, _) = setup();
+        std::fs::write(dir.path().join("upsd.conf"), "LISTEN 0.0.0.0 nut\n").unwrap();
+        assert!(NutConfig::read_existing(dir.path()).is_err());
     }
 }
