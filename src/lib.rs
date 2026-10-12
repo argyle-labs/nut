@@ -22,7 +22,7 @@ pub mod registration;
 pub mod ups;
 
 use crate::client::{NutClient, DEFAULT_PORT};
-use crate::config::{detect_conf_dir, NutConfig};
+use crate::config::{detect_conf_dir, detect_init, InitSystem, NotifySettings, NutConfig};
 
 /// Registry name this plugin uses across the service + diagnostics domains.
 pub const PROVIDER: &str = "nut";
@@ -135,8 +135,16 @@ impl ServiceBackend for NutBackend {
         config: &'a str,
     ) -> BoxFuture<'a, Result<(), ServiceError>> {
         Box::pin(async move {
-            let cfg: NutConfig = serde_json::from_str(config)
-                .map_err(|e| ServiceError::Other(format!("invalid nut config JSON: {e}")))?;
+            let invalid =
+                |e: serde_json::Error| ServiceError::Other(format!("invalid nut config JSON: {e}"));
+            let value: serde_json::Value = serde_json::from_str(config).map_err(invalid)?;
+            let has_notify = value.get("notify").is_some();
+            let mut cfg: NutConfig = serde_json::from_value(value).map_err(invalid)?;
+            if !has_notify {
+                cfg.notify = NotifySettings::for_host(
+                    detect_init(std::path::Path::new("/")) == InitSystem::Unraid,
+                );
+            }
             let dir = detect_conf_dir();
             cfg.apply(&dir).map_err(ServiceError::Other)?;
             Ok(())

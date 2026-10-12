@@ -7,11 +7,12 @@
 //! is another. The diagnostics checks stay; both read the same underlying UPS.
 
 use std::env;
+use std::path::Path;
 
 use plugin_toolkit::contract::ups::{UpsConfig, UpsConfigOutcome, UpsQueryArgs, UpsState};
 
 use crate::client::{NutClient, Ups, DEFAULT_PORT};
-use crate::config::{detect_conf_dir, NutConfig};
+use crate::config::{detect_conf_dir, detect_init, InitSystem, NutConfig};
 
 /// Host `upsd` is reached at. Loopback by default; overridable for a
 /// monitor-only client that watches a remote `upsd`.
@@ -75,8 +76,8 @@ fn config_get_in(dir: &std::path::Path, args: UpsQueryArgs) -> Result<Vec<UpsCon
 }
 
 /// The on-disk config with `cfg`'s kill-power / SHUTDOWNCMD applied.
-fn merged_config(dir: &std::path::Path, cfg: &UpsConfig) -> Result<NutConfig, String> {
-    let mut nut = NutConfig::read_existing(dir)?;
+fn merged_config(dir: &Path, cfg: &UpsConfig, unraid: bool) -> Result<NutConfig, String> {
+    let mut nut = NutConfig::read_existing(dir, unraid)?;
     if let Some(k) = cfg.kill_power {
         nut.upsmon.kill_power = k;
     }
@@ -94,7 +95,8 @@ fn merged_config(dir: &std::path::Path, cfg: &UpsConfig) -> Result<NutConfig, St
 /// topology is preserved.
 pub fn config_set_typed(cfg: UpsConfig) -> UpsConfigOutcome {
     let dir = detect_conf_dir();
-    match merged_config(&dir, &cfg).and_then(|nut| nut.apply(&dir)) {
+    let unraid = detect_init(Path::new("/")) == InitSystem::Unraid;
+    match merged_config(&dir, &cfg, unraid).and_then(|nut| nut.apply(&dir)) {
         Ok(out) if out.written.is_empty() => UpsConfigOutcome {
             id: cfg.id,
             provider: crate::PROVIDER.to_string(),
@@ -173,6 +175,7 @@ mod tests {
                 shutdown_cmd: Some("/sbin/halt\nMONITOR x@y 1 u p master".into()),
                 ..Default::default()
             },
+            false,
         )
         .unwrap_err();
         assert!(err.contains("control character"), "{err}");
@@ -198,6 +201,7 @@ mod tests {
                 shutdown_cmd: Some("/sbin/shutdown -h +0".into()),
                 ..Default::default()
             },
+            false,
         )
         .unwrap();
         assert_eq!(nut.upses.len(), 1);
@@ -239,6 +243,7 @@ mod tests {
                 kill_power: Some(false),
                 ..Default::default()
             },
+            false,
         )
         .unwrap();
         struct NoRestart;

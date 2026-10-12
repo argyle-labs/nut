@@ -433,12 +433,16 @@ pub fn repair_typed(args: RepairArgs) -> RepairOutcome {
         "battery-thresholds" => repair_write_config("safe battery thresholds"),
         "kill-power" => repair_kill_power(),
         "shutdown-command" => repair_write_config("completing, force-unmount-aware SHUTDOWNCMD"),
-        "persistent-event-log" => {
-            repair_upssched_config(&detect_conf_dir(), "persistent + remote event logging")
-        }
-        "onbattery-capture" => {
-            repair_upssched_config(&detect_conf_dir(), "on-battery diagnostics capture hook")
-        }
+        "persistent-event-log" => repair_upssched_config(
+            &detect_conf_dir(),
+            host_is_unraid(),
+            "persistent + remote event logging",
+        ),
+        "onbattery-capture" => repair_upssched_config(
+            &detect_conf_dir(),
+            host_is_unraid(),
+            "on-battery diagnostics capture hook",
+        ),
         "apcupsd-active" => repair_apcupsd_migrate(),
         other => (false, format!("nut has no in-place repair '{other}'")),
     };
@@ -467,8 +471,8 @@ fn repair_write_config(what: &str) -> (bool, String) {
 /// A config repair whose fix lives in `upssched.conf`. A custom `upssched.conf`
 /// is kept verbatim, so the repair refuses; replacing it is an explicit
 /// `service.configure nut` with `replace_custom_upssched`.
-fn repair_upssched_config(dir: &Path, what: &str) -> (bool, String) {
-    let cfg = match merged_safe_config(dir) {
+fn repair_upssched_config(dir: &Path, unraid: bool, what: &str) -> (bool, String) {
+    let cfg = match merged_safe_config_for(dir, unraid, on_tmpfs) {
         Ok(cfg) => cfg,
         Err(e) => return (false, format!("cannot apply {what}: {e}")),
     };
@@ -586,11 +590,11 @@ fn repair_apcupsd_migrate() -> (bool, String) {
 /// topology is already present, so the config-writing repairs don't discard an
 /// operator's UPS/monitor setup while still enforcing the safe values.
 fn merged_safe_config(dir: &Path) -> Result<NutConfig, String> {
-    merged_safe_config_for(
-        dir,
-        detect_init(Path::new("/")) == InitSystem::Unraid,
-        on_tmpfs,
-    )
+    merged_safe_config_for(dir, host_is_unraid(), on_tmpfs)
+}
+
+fn host_is_unraid() -> bool {
+    detect_init(Path::new("/")) == InitSystem::Unraid
 }
 
 /// [`merged_safe_config`] with the host's Unraid-ness and tmpfs probe given.
@@ -599,7 +603,7 @@ fn merged_safe_config_for(
     unraid: bool,
     tmpfs: fn(&Path) -> bool,
 ) -> Result<NutConfig, String> {
-    let mut cfg = NutConfig::read_existing(dir)?;
+    let mut cfg = NutConfig::read_existing(dir, unraid)?;
     // Intentional: the safe-config repairs always enforce kill-power; turning it
     // off is a deliberate ups config_set, not a repair.
     cfg.upsmon.kill_power = true;
@@ -856,7 +860,7 @@ DEADTIME 15
         let s = read_upsmon(write_upsmon(UPSMON_UNSAFE).path()).unwrap();
         assert!(shutdown_cmd_unsafe(&s.as_ref().unwrap().shutdown_cmd));
         let dir = write_upsmon(UPSMON_UNSAFE);
-        let cfg = merged_safe_config(dir.path()).unwrap();
+        let cfg = merged_safe_config_for(dir.path(), false, |_| false).unwrap();
         assert!(!shutdown_cmd_unsafe(&cfg.upsmon.shutdown_cmd));
     }
 
@@ -936,7 +940,7 @@ DEADTIME 15
         )
         .unwrap();
         for what in ["persistent + remote event logging", "on-battery capture"] {
-            let (ok, msg) = repair_upssched_config(dir.path(), what);
+            let (ok, msg) = repair_upssched_config(dir.path(), false, what);
             assert!(!ok);
             assert!(msg.contains("replace_custom_upssched: true"), "{msg}");
         }
@@ -969,7 +973,10 @@ DEADTIME 15
         ] {
             let dir = write_upsmon(bad);
             assert!(read_upsmon(dir.path()).is_err(), "{bad}");
-            assert!(merged_safe_config(dir.path()).is_err(), "{bad}");
+            assert!(
+                merged_safe_config_for(dir.path(), false, |_| false).is_err(),
+                "{bad}"
+            );
         }
     }
 
@@ -997,7 +1004,7 @@ DEADTIME 15
         for f in cfg.render() {
             fs::write(dir.path().join(f.name), f.contents).unwrap();
         }
-        let merged = merged_safe_config(dir.path()).unwrap();
+        let merged = merged_safe_config_for(dir.path(), false, |_| false).unwrap();
         assert_eq!(merged.notify, cfg.notify);
     }
 

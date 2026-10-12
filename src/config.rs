@@ -175,7 +175,7 @@ pub struct NotifySettings {
 
 impl Default for NotifySettings {
     fn default() -> Self {
-        Self::for_host(detect_init(Path::new("/")) == InitSystem::Unraid)
+        Self::for_host(false)
     }
 }
 
@@ -225,7 +225,8 @@ impl NutConfig {
     /// passthrough; only trailing comments on modelled lines (`MONITOR`,
     /// `LISTEN`, `[section]`, `driver = …`) are dropped. A modelled value that
     /// does not parse is an error rather than a silent default.
-    pub fn read_existing(dir: &Path) -> Result<Self, String> {
+    /// `unraid` picks the notify defaults used where the files don't set them.
+    pub fn read_existing(dir: &Path, unraid: bool) -> Result<Self, String> {
         let read = |name: &str| read_or_empty(&dir.join(name));
         let ups = read("ups.conf")?;
         let upsd = read("upsd.conf")?;
@@ -237,7 +238,7 @@ impl NutConfig {
             listen: parse_upsd_conf(&upsd)?,
             monitors: parse_monitors(&upsmon)?,
             upsmon: crate::checks::read_upsmon(dir)?.unwrap_or_default(),
-            notify: parse_notify(&upsmon, managed_sched.then_some(upssched.as_str()))?,
+            notify: parse_notify(&upsmon, managed_sched.then_some(upssched.as_str()), unraid)?,
             ups_globals: parse_ups_globals(&ups),
             upsd_extra: parse_upsd_extra(&upsd),
             upsmon_extra: parse_upsmon_extra(&upsmon),
@@ -557,6 +558,9 @@ impl NutConfig {
             ("remote syslog", &n.remote_syslog),
             ("onbattery capture", &n.onbattery_capture_cmd),
         ]);
+        if n.onbattery_capture_cmd.trim().is_empty() {
+            return Err("onbattery capture command must not be empty".to_string());
+        }
         values.extend(
             self.ups_globals
                 .iter()
@@ -1319,8 +1323,12 @@ fn parse_notify_flags(text: &str) -> Vec<(String, String)> {
 
 /// [`NotifySettings`] from `upsmon.conf`'s `NOTIFYCMD` and, when orca manages
 /// it, `upssched.conf`'s `PIPEFN`/`LOCKFN` and `# orca-*` markers.
-fn parse_notify(upsmon: &str, managed_upssched: Option<&str>) -> Result<NotifySettings, String> {
-    let mut n = NotifySettings::default();
+fn parse_notify(
+    upsmon: &str,
+    managed_upssched: Option<&str>,
+    unraid: bool,
+) -> Result<NotifySettings, String> {
+    let mut n = NotifySettings::for_host(unraid);
     for l in upsmon.lines() {
         let f = tokenize(l);
         if f.first().map(String::as_str) == Some("NOTIFYCMD") {
@@ -1851,7 +1859,7 @@ mod tests {
         cfg.upses[0].extra = vec![("pollinterval".into(), "5".into())];
         cfg.apply_with(dir.path(), &MockServices::default(), &group)
             .unwrap();
-        let read = NutConfig::read_existing(dir.path()).unwrap();
+        let read = NutConfig::read_existing(dir.path(), false).unwrap();
         assert_eq!(read, cfg);
     }
 
@@ -1906,7 +1914,7 @@ NOTIFYFLAG REPLBATT SYSLOG+WALL\n";
     fn full_config_round_trips_without_loss() {
         let (dir, group) = setup();
         write_full(dir.path());
-        let before = NutConfig::read_existing(dir.path()).unwrap();
+        let before = NutConfig::read_existing(dir.path(), false).unwrap();
         assert_eq!(before.upses.len(), 2);
         assert_eq!(before.monitors.len(), 2);
         assert_eq!(before.monitors[0].password, "pass with spaces");
@@ -1915,7 +1923,7 @@ NOTIFYFLAG REPLBATT SYSLOG+WALL\n";
             .contains(&("ignorelb".into(), String::new())));
         let svc = MockServices::default();
         before.apply_with(dir.path(), &svc, &group).unwrap();
-        let after = NutConfig::read_existing(dir.path()).unwrap();
+        let after = NutConfig::read_existing(dir.path(), false).unwrap();
         assert_eq!(after, before);
         for line in [
             "maxretry = 3",
@@ -1953,7 +1961,7 @@ NOTIFYFLAG REPLBATT SYSLOG+WALL\n";
     fn unparsed_monitor_or_section_is_refused() {
         let (dir, group) = setup();
         write_full(dir.path());
-        let mut cfg = NutConfig::read_existing(dir.path()).unwrap();
+        let mut cfg = NutConfig::read_existing(dir.path(), false).unwrap();
         cfg.monitors.pop();
         let err = cfg
             .apply_with(dir.path(), &MockServices::default(), &group)
@@ -1961,7 +1969,7 @@ NOTIFYFLAG REPLBATT SYSLOG+WALL\n";
         assert!(err.contains("MONITOR"), "{err}");
 
         std::fs::write(dir.path().join("ups.conf"), format!("{FULL_UPS}[broken\n")).unwrap();
-        let err = NutConfig::read_existing(dir.path())
+        let err = NutConfig::read_existing(dir.path(), false)
             .unwrap()
             .apply_with(dir.path(), &MockServices::default(), &group)
             .unwrap_err();
@@ -1972,7 +1980,7 @@ NOTIFYFLAG REPLBATT SYSLOG+WALL\n";
     fn dropping_monitors_requires_remove_monitors() {
         let (dir, group) = setup();
         write_full(dir.path());
-        let mut cfg = NutConfig::read_existing(dir.path()).unwrap();
+        let mut cfg = NutConfig::read_existing(dir.path(), false).unwrap();
         let dropped = cfg.monitors.pop().unwrap().system;
         let err = cfg
             .apply_with(dir.path(), &MockServices::default(), &group)
@@ -1996,7 +2004,7 @@ NOTIFYFLAG REPLBATT SYSLOG+WALL\n";
     fn remove_monitors_cannot_empty_the_config() {
         let (dir, group) = setup();
         write_full(dir.path());
-        let mut cfg = NutConfig::read_existing(dir.path()).unwrap();
+        let mut cfg = NutConfig::read_existing(dir.path(), false).unwrap();
         cfg.remove_monitors = cfg.monitors.drain(..).map(|m| m.system).collect();
         let err = cfg
             .apply_with(dir.path(), &MockServices::default(), &group)
@@ -2070,7 +2078,7 @@ NOTIFYFLAG REPLBATT SYSLOG+WALL\n";
     fn monitor_in_both_lists_is_refused() {
         let (dir, group) = setup();
         write_full(dir.path());
-        let mut cfg = NutConfig::read_existing(dir.path()).unwrap();
+        let mut cfg = NutConfig::read_existing(dir.path(), false).unwrap();
         cfg.remove_monitors = vec![cfg.monitors[0].system.clone()];
         let err = cfg
             .apply_with(dir.path(), &MockServices::default(), &group)
@@ -2082,7 +2090,7 @@ NOTIFYFLAG REPLBATT SYSLOG+WALL\n";
     fn swapped_monitor_name_is_refused() {
         let (dir, group) = setup();
         write_full(dir.path());
-        let mut cfg = NutConfig::read_existing(dir.path()).unwrap();
+        let mut cfg = NutConfig::read_existing(dir.path(), false).unwrap();
         cfg.monitors[1].system = "serverups@127.0.0.1".into();
         let err = cfg
             .apply_with(dir.path(), &MockServices::default(), &group)
@@ -2097,7 +2105,7 @@ NOTIFYFLAG REPLBATT SYSLOG+WALL\n";
         let mon = dir.path().join("upsmon.conf");
         let text = std::fs::read_to_string(&mon).unwrap() + "NOTIFYFLAG ONBATT SYSLOG+IGNORE\n";
         std::fs::write(&mon, text).unwrap();
-        let cfg = NutConfig::read_existing(dir.path()).unwrap();
+        let cfg = NutConfig::read_existing(dir.path(), false).unwrap();
         let out = cfg
             .apply_with(dir.path(), &MockServices::default(), &group)
             .unwrap();
@@ -2144,6 +2152,16 @@ NOTIFYFLAG REPLBATT SYSLOG+WALL\n";
     }
 
     #[test]
+    fn empty_onbattery_capture_is_rejected() {
+        for cmd in ["", "  "] {
+            let mut cfg = sample();
+            cfg.notify.onbattery_capture_cmd = cmd.into();
+            let err = cfg.check_values().unwrap_err();
+            assert!(err.contains("onbattery capture"), "{err}");
+        }
+    }
+
+    #[test]
     fn onbattery_capture_marker_is_raw_text() {
         let mut cfg = sample();
         cfg.notify.onbattery_capture_cmd = r#"sh -c "orca diagnose" >> /x\y.json"#.into();
@@ -2152,7 +2170,7 @@ NOTIFYFLAG REPLBATT SYSLOG+WALL\n";
             sched.contains("# orca-onbattery-capture sh -c \"orca diagnose\" >> /x\\y.json\n"),
             "{sched}"
         );
-        let n = parse_notify("", Some(&sched)).unwrap();
+        let n = parse_notify("", Some(&sched), false).unwrap();
         assert_eq!(n.onbattery_capture_cmd, cfg.notify.onbattery_capture_cmd);
     }
 
@@ -2202,7 +2220,7 @@ NOTIFYFLAG REPLBATT SYSLOG+WALL\n";
             t.replace("  nolock\n", "  nolock\n  # section note\n"),
         )
         .unwrap();
-        let cfg = NutConfig::read_existing(dir.path()).unwrap();
+        let cfg = NutConfig::read_existing(dir.path(), false).unwrap();
         cfg.apply_with(dir.path(), &MockServices::default(), &group)
             .unwrap();
         for (name, line) in [
@@ -2215,7 +2233,7 @@ NOTIFYFLAG REPLBATT SYSLOG+WALL\n";
             let t = std::fs::read_to_string(dir.path().join(name)).unwrap();
             assert!(t.contains(line), "{line}\n{t}");
         }
-        assert_eq!(NutConfig::read_existing(dir.path()).unwrap(), cfg);
+        assert_eq!(NutConfig::read_existing(dir.path(), false).unwrap(), cfg);
     }
 
     #[test]
@@ -2247,7 +2265,7 @@ NOTIFYFLAG REPLBATT SYSLOG+WALL\n";
         assert!(parse_upsd_conf("LISTEN 0.0.0.0 nut\n").is_err());
         let (dir, _) = setup();
         std::fs::write(dir.path().join("upsd.conf"), "LISTEN 0.0.0.0 nut\n").unwrap();
-        assert!(NutConfig::read_existing(dir.path()).is_err());
+        assert!(NutConfig::read_existing(dir.path(), false).is_err());
     }
 
     #[test]
@@ -2260,7 +2278,7 @@ NOTIFYFLAG REPLBATT SYSLOG+WALL\n";
         cfg.notify.log_path = "/boot/nut logs/events.log".into();
         cfg.apply_with(dir.path(), &MockServices::default(), &group)
             .unwrap();
-        let read = NutConfig::read_existing(dir.path()).unwrap();
+        let read = NutConfig::read_existing(dir.path(), false).unwrap();
         assert_eq!(read.upsmon.shutdown_cmd, cfg.upsmon.shutdown_cmd);
         assert_eq!(read.upsmon.power_down_flag, cfg.upsmon.power_down_flag);
         assert_eq!(read.notify, cfg.notify);
@@ -2289,13 +2307,13 @@ NOTIFYFLAG REPLBATT SYSLOG+WALL\n";
     fn unreadable_files_fail_closed() {
         let (dir, group) = setup();
         std::fs::create_dir(dir.path().join("upsmon.conf")).unwrap();
-        assert!(NutConfig::read_existing(dir.path()).is_err());
+        assert!(NutConfig::read_existing(dir.path(), false).is_err());
         assert!(sample()
             .apply_with(dir.path(), &MockServices::default(), &group)
             .is_err());
         let (dir, group) = setup();
         std::fs::create_dir(dir.path().join("ups.conf")).unwrap();
-        assert!(NutConfig::read_existing(dir.path()).is_err());
+        assert!(NutConfig::read_existing(dir.path(), false).is_err());
         assert!(sample()
             .apply_with(dir.path(), &MockServices::default(), &group)
             .is_err());
@@ -2310,6 +2328,6 @@ NOTIFYFLAG REPLBATT SYSLOG+WALL\n";
             "MONITOR u@localhost x user pass master\n",
         )
         .unwrap();
-        assert!(NutConfig::read_existing(dir.path()).is_err());
+        assert!(NutConfig::read_existing(dir.path(), false).is_err());
     }
 }
