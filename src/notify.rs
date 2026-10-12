@@ -9,7 +9,7 @@
 //! handler always exits 0 so it can never block or crash `upsmon`.
 
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::{ToSocketAddrs, UdpSocket};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
@@ -309,13 +309,15 @@ fn install_symlink(path: &Path, parent: &Path, exe: &Path) -> Result<bool, Strin
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("stat {shown}: {e}")),
     }
-    let tmp = parent.join(format!(".{HANDLER_NAME}.{}.tmp", random_suffix()?));
+    let tmp = tmp_path(parent);
+    fs::remove_file(&tmp).ok();
     // `symlink` fails on an existing path, so a pre-planted tmp is never followed.
     std::os::unix::fs::symlink(exe, &tmp).map_err(|e| format!("symlink {}: {e}", tmp.display()))?;
     fs::rename(&tmp, path).map_err(|e| {
         fs::remove_file(&tmp).ok();
         format!("install {shown}: {e}")
     })?;
+    sync_dir(parent)?;
     Ok(true)
 }
 
@@ -325,15 +327,30 @@ fn install_copy(path: &Path, parent: &Path, exe: &Path, persist: &Path) -> Resul
     let prior = fs::read(persist).ok();
     let mut changed = false;
     // Ownership: a regular file is ours iff its bytes equal the current binary or
-    // the flash copy we wrote before (checked before that copy is refreshed).
+    // the flash copy. `path` is written before the flash copy, so a failed flash
+    // write still leaves `path` equal to the binary and recognised next run.
     let current = match fs::symlink_metadata(path) {
         Ok(m) if m.file_type().is_symlink() => None,
         Ok(m) if m.is_file() => {
-            let have = fs::read(path).map_err(|e| format!("read {shown}: {e}"))?;
-            if have != want && prior.as_ref() != Some(&have) {
-                return Err(format!(
-                    "{shown} exists and is not orca's handler; refusing to replace it"
-                ));
+            let len = m.len() as usize;
+            let candidate = len == want.len() || prior.as_ref().is_some_and(|p| p.len() == len);
+            let have = if candidate {
+                fs::read(path).map_err(|e| format!("read {shown}: {e}"))?
+            } else {
+                Vec::new()
+            };
+            if !candidate || (have != want && prior.as_ref() != Some(&have)) {
+                return Err(match prior {
+                    None => format!(
+                        "{shown} differs from the plugin binary and the flash copy {} is \
+                         missing, so it cannot be recognised as orca's handler; refusing to \
+                         replace it",
+                        persist.display()
+                    ),
+                    Some(_) => {
+                        format!("{shown} exists and is not orca's handler; refusing to replace it")
+                    }
+                });
             }
             Some(have)
         }
@@ -345,6 +362,10 @@ fn install_copy(path: &Path, parent: &Path, exe: &Path, persist: &Path) -> Resul
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(format!("stat {shown}: {e}")),
     };
+    if current.as_ref() != Some(&want) || !is_executable(path) {
+        write_atomic(path, parent, &want)?;
+        changed = true;
+    }
     if prior.as_ref() != Some(&want) {
         let dir = persist
             .parent()
@@ -353,17 +374,27 @@ fn install_copy(path: &Path, parent: &Path, exe: &Path, persist: &Path) -> Resul
         write_atomic(persist, dir, &want)?;
         changed = true;
     }
-    if current.as_ref() != Some(&want) || !is_executable(path) {
-        write_atomic(path, parent, &want)?;
-        changed = true;
-    }
     Ok(changed)
+}
+
+/// Fixed temp name in `dir`, so a crashed run's leftover is reused, not accumulated.
+fn tmp_path(dir: &Path) -> PathBuf {
+    dir.join(format!(".{HANDLER_NAME}.tmp"))
+}
+
+/// Persist a rename by fsyncing its directory.
+fn sync_dir(dir: &Path) -> Result<(), String> {
+    fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(|e| format!("sync {}: {e}", dir.display()))
 }
 
 /// Write `bytes` to a fresh 0755 temp file in `dir`, then rename it over `path`.
 fn write_atomic(path: &Path, dir: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::os::unix::fs::OpenOptionsExt;
-    let tmp = dir.join(format!(".{HANDLER_NAME}.{}.tmp", random_suffix()?));
+    let tmp = tmp_path(dir);
+    // Unlinking first means `create_new` never follows a pre-planted symlink.
+    fs::remove_file(&tmp).ok();
     let res = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -374,15 +405,8 @@ fn write_atomic(path: &Path, dir: &Path, bytes: &[u8]) -> Result<(), String> {
     res.map_err(|e| {
         fs::remove_file(&tmp).ok();
         format!("install {}: {e}", path.display())
-    })
-}
-
-fn random_suffix() -> Result<String, String> {
-    let mut b = [0u8; 8];
-    fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut b))
-        .map_err(|e| format!("read /dev/urandom: {e}"))?;
-    Ok(b.iter().map(|x| format!("{x:02x}")).collect())
+    })?;
+    sync_dir(dir)
 }
 
 /// The running binary, minus the " (deleted)" suffix Linux appends once it is
@@ -417,7 +441,10 @@ pub fn ensure_installed_at_startup() {
         return;
     };
     if let Err(e) = ensure_installed(&cmd) {
-        eprintln!("warning: nut notify handler not installed: {e}");
+        eprintln!(
+            "warning: nut notify handler not installed: {e}{}",
+            crate::config::privilege_hint(&e)
+        );
     }
 }
 
@@ -701,5 +728,52 @@ mod tests {
             Ok(true)
         );
         assert!(fs::symlink_metadata(&path).unwrap().is_file());
+    }
+    #[test]
+    fn unraid_copy_recovers_after_a_failed_flash_write() {
+        let root = tempfile::tempdir().unwrap();
+        let exe = exe_in(root.path());
+        let path = root.path().join(HANDLER_NAME);
+        let flash = root.path().join("flash");
+        fs::write(&flash, "blocks create_dir_all").unwrap();
+        let persist = flash.join(HANDLER_NAME);
+        assert!(install_handler_in(&path, &exe, &[root.path()], Some(&persist)).is_err());
+        assert_eq!(fs::read(&path).unwrap(), fs::read(&exe).unwrap());
+        fs::remove_file(&flash).unwrap();
+        assert_eq!(
+            install_handler_in(&path, &exe, &[root.path()], Some(&persist)),
+            Ok(true)
+        );
+        assert_eq!(fs::read(&persist).unwrap(), fs::read(&exe).unwrap());
+    }
+
+    #[test]
+    fn unraid_copy_names_a_missing_flash_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let exe = exe_in(root.path());
+        let path = root.path().join(HANDLER_NAME);
+        fs::write(&path, "older handler").unwrap();
+        let persist = root.path().join("flash").join(HANDLER_NAME);
+        let err = install_handler_in(&path, &exe, &[root.path()], Some(&persist)).unwrap_err();
+        assert!(
+            err.contains("flash copy") && err.contains("missing"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn install_reuses_a_stale_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = exe_in(dir.path());
+        let bin = dir.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        fs::write(tmp_path(&bin), "leftover").unwrap();
+        let path = bin.join(HANDLER_NAME);
+        let persist = dir.path().join("flash").join(HANDLER_NAME);
+        assert_eq!(
+            install_handler_in(&path, &exe, &[&bin], Some(&persist)),
+            Ok(true)
+        );
+        assert_eq!(fs::read_dir(&bin).unwrap().count(), 1);
     }
 }

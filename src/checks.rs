@@ -570,12 +570,6 @@ fn write_config(dir: &Path, what: &str, cfg: NutConfig) -> (bool, String) {
             ),
         );
     }
-    if let Err(e) = crate::notify::ensure_installed(&cfg.notify.notify_cmd) {
-        return (
-            false,
-            format!("cannot apply {what}: notify handler not installed ({e}); nothing written"),
-        );
-    }
     match cfg.apply(dir) {
         Ok(out) if out.written.is_empty() && out.message.is_empty() => (
             true,

@@ -147,8 +147,6 @@ impl ServiceBackend for NutBackend {
                 );
             }
             let dir = detect_conf_dir();
-            // A config naming a handler that cannot be installed is never written.
-            notify::ensure_installed(&cfg.notify.notify_cmd).map_err(ServiceError::Other)?;
             cfg.apply(&dir).map_err(ServiceError::Other)?;
             Ok(())
         })

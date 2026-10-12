@@ -271,9 +271,29 @@ impl NutConfig {
     }
 
     /// Write every rendered file into `dir`, only touching files whose content
-    /// changed, then restart the NUT daemons this topology runs.
+    /// changed, then restart the NUT daemons this topology runs. The notify
+    /// handler is installed first; a config naming one that cannot be installed
+    /// is never written.
     pub fn apply(&self, dir: &Path) -> Result<ApplyOutcome, String> {
-        self.apply_with(dir, &SystemServices::new(), Path::new("/etc/group"))
+        self.apply_gated(dir, &crate::notify::ensure_installed, |cfg| {
+            cfg.apply_with(dir, &SystemServices::new(), Path::new("/etc/group"))
+        })
+    }
+
+    /// [`apply`](Self::apply) with an injectable handler installer and writer.
+    pub(crate) fn apply_gated(
+        &self,
+        dir: &Path,
+        install: &dyn Fn(&str) -> Result<Option<bool>, String>,
+        write: impl FnOnce(&Self) -> Result<ApplyOutcome, String>,
+    ) -> Result<ApplyOutcome, String> {
+        install(&self.notify.notify_cmd).map_err(|e| {
+            format!(
+                "notify handler not installed ({e}); nothing written in {}",
+                dir.display()
+            )
+        })?;
+        write(self)
     }
 
     /// [`apply`](Self::apply) with injectable service control and group file.
