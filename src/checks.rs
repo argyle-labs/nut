@@ -540,11 +540,13 @@ pub fn repair_typed(args: RepairArgs) -> RepairOutcome {
             &detect_conf_dir(),
             host_is_unraid(),
             "persistent + remote event logging",
+            false,
         ),
         "onbattery-capture" => repair_upssched_config(
             &detect_conf_dir(),
             host_is_unraid(),
             "on-battery diagnostics capture hook",
+            true,
         ),
         "apcupsd-active" => repair_apcupsd_migrate(),
         "notify-handler" => repair_notify_handler(&detect_conf_dir()),
@@ -574,9 +576,15 @@ fn repair_write_config(what: &str) -> (bool, String) {
 
 /// A config repair whose fix lives in `upssched.conf`. A custom `upssched.conf`
 /// is kept verbatim, so the repair refuses; replacing it is an explicit
-/// `service.configure nut` with `replace_custom_upssched`.
-fn repair_upssched_config(dir: &Path, unraid: bool, what: &str) -> (bool, String) {
-    let cfg = match merged_safe_config_for(dir, unraid, on_tmpfs) {
+/// `service.configure nut` with `replace_custom_upssched`. With
+/// `take_over_notify`, a foreign `NOTIFYCMD` is replaced by orca's handler.
+fn repair_upssched_config(
+    dir: &Path,
+    unraid: bool,
+    what: &str,
+    take_over_notify: bool,
+) -> (bool, String) {
+    let mut cfg = match merged_safe_config_for(dir, unraid, on_tmpfs) {
         Ok(cfg) => cfg,
         Err(e) => return (false, format!("cannot apply {what}: {e}")),
     };
@@ -591,7 +599,28 @@ fn repair_upssched_config(dir: &Path, unraid: bool, what: &str) -> (bool, String
             ),
         );
     }
-    write_config(dir, what, cfg)
+    let replaced = take_over_notify
+        .then(|| take_over_notify_cmd(&mut cfg, unraid))
+        .flatten();
+    let (ok, msg) = write_config(dir, what, cfg);
+    match replaced {
+        Some(old) if ok => (
+            ok,
+            format!("{msg}; replaces NOTIFYCMD {old} with the orca handler"),
+        ),
+        _ => (ok, msg),
+    }
+}
+
+/// Point `NOTIFYCMD` at the host's orca handler, returning the replaced
+/// command. Ordinary applies keep an operator's `NOTIFYCMD`; only the
+/// onbattery-capture repair takes it over, since capture needs the handler.
+fn take_over_notify_cmd(cfg: &mut NutConfig, unraid: bool) -> Option<String> {
+    let ours = NotifySettings::for_host(unraid).notify_cmd;
+    if notify::invoked_as_handler(&cfg.notify.notify_cmd) {
+        return None;
+    }
+    Some(std::mem::replace(&mut cfg.notify.notify_cmd, ours))
 }
 
 fn write_config(dir: &Path, what: &str, cfg: NutConfig) -> (bool, String) {
@@ -1090,6 +1119,29 @@ DEADTIME 15
     }
 
     #[test]
+    fn onbattery_capture_take_over_replaces_foreign_notifycmd() {
+        let upsmon = rendered("upsmon.conf")
+            .replace("/usr/local/bin/orca-nut-notify", "/usr/local/bin/mine")
+            .replace(
+                "NOTIFYFLAG ONBATT SYSLOG+WALL+EXEC",
+                "NOTIFYFLAG ONBATT SYSLOG",
+            );
+        let dir = write_upsmon(&upsmon);
+        std::fs::write(dir.path().join("upssched.conf"), rendered("upssched.conf")).unwrap();
+        let mut cfg = merged_safe_config_for(dir.path(), false, |_| false).unwrap();
+        assert_eq!(
+            take_over_notify_cmd(&mut cfg, false).as_deref(),
+            Some("/usr/local/bin/mine")
+        );
+        let files = cfg.render();
+        let get = |n: &str| files.iter().find(|f| f.name == n).unwrap().contents.clone();
+        let f = check_onbattery_capture(Some(&get("upsmon.conf")), &get("upssched.conf"))
+            .expect("finding");
+        assert_eq!(f.severity, Severity::Ok);
+        assert!(take_over_notify_cmd(&mut cfg, false).is_none());
+    }
+
+    #[test]
     fn onbattery_capture_warns_without_onbatt_exec() {
         let upsmon: String = rendered("upsmon.conf")
             .lines()
@@ -1136,7 +1188,7 @@ DEADTIME 15
         )
         .unwrap();
         for what in ["persistent + remote event logging", "on-battery capture"] {
-            let (ok, msg) = repair_upssched_config(dir.path(), false, what);
+            let (ok, msg) = repair_upssched_config(dir.path(), false, what, true);
             assert!(!ok);
             assert!(msg.contains("replace_custom_upssched: true"), "{msg}");
         }
