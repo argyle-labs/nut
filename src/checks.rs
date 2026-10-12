@@ -40,9 +40,26 @@ fn shutdown_cmd_unsafe(cmd: &str) -> bool {
 /// directly on the shared reactor (the provider future already runs under it),
 /// so nothing here re-enters `block_on`.
 pub async fn diagnose_typed(_args: DiagnoseArgs) -> Vec<Finding> {
-    let dir = detect_conf_dir();
+    diagnose_in(
+        &detect_conf_dir(),
+        Path::new("/"),
+        apcupsd_present(),
+        probe_upses(),
+    )
+    .await
+}
+
+/// [`diagnose_typed`] against an explicit config dir, filesystem root,
+/// apcupsd presence, and upsd probe, so tests never touch the host.
+/// `probe` is only awaited when a check needs it.
+async fn diagnose_in(
+    dir: &Path,
+    root: &Path,
+    apcupsd: bool,
+    probe: impl std::future::Future<Output = Result<Vec<Ups>, String>>,
+) -> Vec<Finding> {
     let mut findings: Vec<Finding> = Vec::new();
-    let upsmon_parsed = read_upsmon_with_text(&dir).unwrap_or_else(|e| {
+    let upsmon_parsed = read_upsmon_with_text(dir).unwrap_or_else(|e| {
         findings.push(finding(
             "upsmon-conf",
             Severity::Crit,
@@ -72,10 +89,10 @@ pub async fn diagnose_typed(_args: DiagnoseArgs) -> Vec<Finding> {
     let ups_conf = read("ups-conf", "ups.conf");
     // A `ups-comms` finding is only meaningful when this host is a NUT server
     // (has ups.conf sections) or runs apcupsd (migration candidate).
-    let needs_comms = !ups_conf.trim().is_empty() || apcupsd_present();
+    let needs_comms = !ups_conf.trim().is_empty() || apcupsd;
     // Probe upsd once and share the result across the comms + battery checks.
     let probe: Option<Result<Vec<Ups>, String>> = if needs_comms || upsmon.is_some() {
-        Some(probe_upses().await)
+        Some(probe.await)
     } else {
         None
     };
@@ -84,7 +101,7 @@ pub async fn diagnose_typed(_args: DiagnoseArgs) -> Vec<Finding> {
         .and_then(|r| r.as_ref().ok())
         .and_then(|upses| upses.iter().find_map(|u| u.battery_runtime()));
 
-    findings.extend(check_apcupsd_active());
+    findings.extend(check_apcupsd_active(apcupsd));
     if needs_comms {
         // `probe` is `Some` whenever `needs_comms` is true.
         findings.push(check_ups_comms(probe.as_ref().expect("probed when needed")));
@@ -95,7 +112,7 @@ pub async fn diagnose_typed(_args: DiagnoseArgs) -> Vec<Finding> {
     findings.extend(check_persistent_event_log(
         &upsmon,
         &upssched,
-        detect_init(Path::new("/")) == InitSystem::Unraid,
+        detect_init(root) == InitSystem::Unraid,
         on_tmpfs,
     ));
     findings.extend(check_onbattery_capture(&upssched));
@@ -144,8 +161,8 @@ fn repair_spec(id: &str, description: &str) -> RepairSpec {
 // ── checks ───────────────────────────────────────────────────────────────────
 
 /// `apcupsd-active`: the stock apcupsd daemon is in use instead of NUT.
-fn check_apcupsd_active() -> Option<Finding> {
-    if !apcupsd_present() {
+fn check_apcupsd_active(apcupsd: bool) -> Option<Finding> {
+    if !apcupsd {
         return None;
     }
     Some(finding(
@@ -1140,7 +1157,11 @@ DEADTIME 15
 
     #[tokio::test]
     async fn diagnose_emits_typed_findings() {
-        let findings = diagnose_typed(DiagnoseArgs::default()).await;
+        let conf = write_upsmon(UPSMON_SAFE);
+        let root = tempfile::tempdir().unwrap();
+        let probe = async { Err("no upsd in tests".to_string()) };
+        let findings = diagnose_in(conf.path(), root.path(), false, probe).await;
+        assert!(!findings.is_empty());
         for f in &findings {
             assert_eq!(f.provider, crate::PROVIDER);
         }
