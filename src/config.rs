@@ -175,17 +175,28 @@ pub struct NotifySettings {
 
 impl Default for NotifySettings {
     fn default() -> Self {
+        Self::for_host(detect_init(Path::new("/")) == InitSystem::Unraid)
+    }
+}
+
+impl NotifySettings {
+    /// Defaults for an Unraid host (flash under `/boot`) or any other (`/var/log/nut`).
+    pub fn for_host(unraid: bool) -> Self {
+        let dir = if unraid {
+            "/boot/config/plugins/nut"
+        } else {
+            "/var/log/nut"
+        };
         Self {
             notify_cmd: "/usr/local/bin/orca-nut-notify".to_string(),
             pipe: "/var/run/nut/upssched.pipe".to_string(),
             lock: "/var/run/nut/upssched.lock".to_string(),
-            // Flash-backed by default so records survive a power-cycle.
-            log_path: "/boot/config/plugins/nut/events.log".to_string(),
+            log_path: format!("{dir}/events.log"),
             // Generic placeholder — no real fleet host. Overridden at deploy.
             remote_syslog: "syslog-collector.example.invalid:514".to_string(),
-            onbattery_capture_cmd:
-                "/usr/local/bin/orca diagnostics diagnose >> /boot/config/plugins/nut/onbattery.json"
-                    .to_string(),
+            onbattery_capture_cmd: format!(
+                "/usr/local/bin/orca diagnostics diagnose >> {dir}/onbattery.json"
+            ),
         }
     }
 }
@@ -278,6 +289,40 @@ impl NutConfig {
     ) -> Result<ApplyOutcome, String> {
         self.check_values()
             .map_err(|e| format!("refusing to apply: {e}"))?;
+        let ignored: Vec<&str> = self
+            .notify_flags
+            .iter()
+            .filter(|(e, f)| {
+                MANAGED_EVENTS.contains(&e.as_str()) && f.split('+').any(|f| f == "IGNORE")
+            })
+            .map(|(e, _)| e.as_str())
+            .collect();
+        if !ignored.is_empty() {
+            let mut cfg = self.clone();
+            for (event, flags) in &mut cfg.notify_flags {
+                if !MANAGED_EVENTS.contains(&event.as_str()) {
+                    continue;
+                }
+                *flags = flags
+                    .split('+')
+                    .filter(|f| *f != "IGNORE")
+                    .collect::<Vec<_>>()
+                    .join("+");
+            }
+            cfg.notify_flags.retain(|(_, f)| !f.is_empty());
+            let mut out = cfg.apply_with(dir, services, group_file)?;
+            let note = format!(
+                "dropped IGNORE from NOTIFYFLAG {}: orca relies on these events for logging and \
+                 shutdown",
+                ignored.join(", ")
+            );
+            out.message = if out.message.is_empty() {
+                note
+            } else {
+                format!("{note}; {}", out.message)
+            };
+            return Ok(out);
+        }
         if self.monitors.is_empty() {
             return Err(
                 "refusing to apply: config has no MONITOR lines, so upsmon would \
@@ -477,7 +522,8 @@ impl NutConfig {
     }
 
     /// Every value apply would render must be free of control characters (a
-    /// newline would inject a directive); managed events cannot be `IGNORE`d.
+    /// newline would inject a directive); values rendered unquoted must be a
+    /// single bare NUT token.
     pub(crate) fn check_values(&self) -> Result<(), String> {
         let mut values: Vec<(&str, &str)> = Vec::new();
         for u in &self.upses {
@@ -532,11 +578,41 @@ impl NutConfig {
         for (what, v) in values {
             check_value(what, v)?;
         }
-        for (event, flags) in &self.notify_flags {
-            if MANAGED_EVENTS.contains(&event.as_str()) && flags.split('+').any(|f| f == "IGNORE") {
+        let mut words: Vec<(&str, &str)> = Vec::new();
+        for u in &self.upses {
+            words.push(("ups name", &u.name));
+            // A bare key starting with `#` is a carried-over comment line.
+            words.extend(
+                u.extra
+                    .iter()
+                    .filter(|(k, v)| !(v.is_empty() && k.starts_with('#')))
+                    .map(|(k, _)| ("ups option", k.as_str())),
+            );
+        }
+        words.extend(self.listen.iter().map(|l| ("LISTEN", l.address.as_str())));
+        for m in &self.monitors {
+            words.extend([
+                ("MONITOR system", m.system.as_str()),
+                ("MONITOR role", &m.role),
+            ]);
+        }
+        for (what, v) in words {
+            if v.is_empty()
+                || v.contains(|c: char| c.is_whitespace() || matches!(c, '"' | '#' | '\\'))
+            {
                 return Err(format!(
-                    "NOTIFYFLAG {event} IGNORE would silence an event orca relies on for logging \
-                     and shutdown; remove IGNORE"
+                    "{what} value {v:?} must be non-empty and free of whitespace, '\"', '#' and '\\'"
+                ));
+            }
+        }
+        let flag_list = |s: &str| {
+            s.split('+')
+                .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_uppercase()))
+        };
+        for (event, flags) in &self.notify_flags {
+            if !flag_list(event) || !flag_list(flags) {
+                return Err(format!(
+                    "NOTIFYFLAG {event:?} {flags:?} must be upper-case words joined by '+'"
                 ));
             }
         }
@@ -653,9 +729,10 @@ impl NutConfig {
             "# orca-remote-syslog {}\n",
             quote_token(&n.remote_syslog)
         ));
+        // Raw text: the handler reads this comment payload verbatim, not as a NUT token.
         out.push_str(&format!(
             "# orca-onbattery-capture {}\n",
-            quote_token(&n.onbattery_capture_cmd)
+            n.onbattery_capture_cmd
         ));
         out
     }
@@ -1266,26 +1343,44 @@ fn parse_notify(upsmon: &str, managed_upssched: Option<&str>) -> Result<NotifySe
     for (key, field) in [
         ("orca-log-path", &mut n.log_path),
         ("orca-remote-syslog", &mut n.remote_syslog),
-        ("orca-onbattery-capture", &mut n.onbattery_capture_cmd),
     ] {
         if let Some(v) = marker_value(sched, key).filter(|v| !v.is_empty()) {
             *field = v;
         }
+    }
+    if let Some(v) = marker_raw(sched, "orca-onbattery-capture").filter(|v| !v.is_empty()) {
+        n.onbattery_capture_cmd = v.to_string();
     }
     Ok(n)
 }
 
 /// Read the value of an `# orca-<key> <value>` marker comment the managed
 /// `upssched.conf` embeds (the handler's single source of truth).
+/// A value we quoted is unquoted; a legacy value with a `\` or more than one
+/// token is taken as raw text.
 pub(crate) fn marker_value(upssched: &str, key: &str) -> Option<String> {
+    marker_raw(upssched, key).map(|v| match tokenize(v).as_slice() {
+        [t] if v.starts_with('"') || !v.contains('\\') => t.clone(),
+        _ => v.to_string(),
+    })
+}
+
+/// The trimmed text after an `# orca-<key> ` marker prefix.
+fn marker_raw<'a>(upssched: &'a str, key: &str) -> Option<&'a str> {
     let prefix = format!("# {key} ");
     upssched
         .lines()
         .find_map(|l| l.trim_start().strip_prefix(&prefix))
-        .map(|v| match tokenize(v).as_slice() {
-            [t] => t.clone(),
-            _ => v.trim().to_string(),
-        })
+        .map(str::trim)
+}
+
+/// `"; needs privilege"` when `e` is a permission error, else empty.
+pub(crate) fn privilege_hint(e: &str) -> &'static str {
+    if e.contains("(os error 13)") || e.contains("(os error 1)") {
+        "; needs privilege"
+    } else {
+        ""
+    }
 }
 
 /// gid of the `nut` group from `group_file`, if present.
@@ -1996,17 +2091,78 @@ NOTIFYFLAG REPLBATT SYSLOG+WALL\n";
     }
 
     #[test]
-    fn ignore_on_managed_event_is_refused() {
+    fn ignore_on_managed_event_is_dropped() {
         let (dir, group) = setup();
         write_full(dir.path());
         let mon = dir.path().join("upsmon.conf");
         let text = std::fs::read_to_string(&mon).unwrap() + "NOTIFYFLAG ONBATT SYSLOG+IGNORE\n";
         std::fs::write(&mon, text).unwrap();
         let cfg = NutConfig::read_existing(dir.path()).unwrap();
-        let err = cfg
+        let out = cfg
             .apply_with(dir.path(), &MockServices::default(), &group)
-            .unwrap_err();
-        assert!(err.contains("NOTIFYFLAG ONBATT IGNORE"), "{err}");
+            .unwrap();
+        assert!(
+            out.message
+                .contains("dropped IGNORE from NOTIFYFLAG ONBATT"),
+            "{out:?}"
+        );
+        let mon = std::fs::read_to_string(&mon).unwrap();
+        assert!(!mon.contains("IGNORE"), "{mon}");
+        assert!(
+            mon.contains("NOTIFYFLAG ONBATT SYSLOG+WALL+EXEC\n"),
+            "{mon}"
+        );
+        let again = cfg
+            .apply_with(dir.path(), &MockServices::default(), &group)
+            .unwrap();
+        assert!(again.written.is_empty());
+        assert!(again.message.contains("dropped IGNORE"), "{again:?}");
+    }
+
+    #[test]
+    fn unquoted_fields_must_be_bare_tokens() {
+        let bad: [fn(&mut NutConfig); 9] = [
+            |c| c.monitors[0].system = "serverups@local\thost".into(),
+            |c| c.monitors[0].system = String::new(),
+            |c| c.monitors[0].role = "master #x".into(),
+            |c| c.listen[0].address = "0.0.0.0\"".into(),
+            |c| c.upses[0].name = "server ups".into(),
+            |c| c.upses[0].extra = vec![("a\\b".into(), "1".into())],
+            |c| c.notify_flags = vec![("ONBATT".into(), "wall".into())],
+            |c| c.notify_flags = vec![("ONBATT".into(), "WALL+".into())],
+            |c| c.notify_flags = vec![("ON BATT".into(), "WALL".into())],
+        ];
+        for (i, f) in bad.iter().enumerate() {
+            let mut cfg = sample();
+            f(&mut cfg);
+            assert!(cfg.check_values().is_err(), "case {i}");
+        }
+        let mut cfg = sample();
+        cfg.upses[0].extra = vec![("# a note".into(), String::new())];
+        cfg.notify_flags = vec![("ONBATT".into(), "WALL+EXEC".into())];
+        assert!(cfg.check_values().is_ok());
+    }
+
+    #[test]
+    fn onbattery_capture_marker_is_raw_text() {
+        let mut cfg = sample();
+        cfg.notify.onbattery_capture_cmd = r#"sh -c "orca diagnose" >> /x\y.json"#.into();
+        let sched = cfg.render_upssched_conf();
+        assert!(
+            sched.contains("# orca-onbattery-capture sh -c \"orca diagnose\" >> /x\\y.json\n"),
+            "{sched}"
+        );
+        let n = parse_notify("", Some(&sched)).unwrap();
+        assert_eq!(n.onbattery_capture_cmd, cfg.notify.onbattery_capture_cmd);
+    }
+
+    #[test]
+    fn legacy_marker_falls_back_to_raw_text() {
+        let get = |v: &str| marker_value(&format!("# orca-log-path {v}\n"), "orca-log-path");
+        assert_eq!(get(r"/a\ b").as_deref(), Some(r"/a\ b"));
+        assert_eq!(get("/a b ").as_deref(), Some("/a b"));
+        assert_eq!(get(r#""/a \"b\"""#).as_deref(), Some(r#"/a "b""#));
+        assert_eq!(get("/var/log/x").as_deref(), Some("/var/log/x"));
     }
 
     #[test]

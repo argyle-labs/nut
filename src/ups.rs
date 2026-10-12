@@ -99,7 +99,15 @@ pub fn config_set_typed(cfg: UpsConfig) -> UpsConfigOutcome {
             id: cfg.id,
             provider: crate::PROVIDER.to_string(),
             ok: true,
-            message: format!("config already in place at {}", dir.display()),
+            message: if out.message.is_empty() {
+                format!("config already in place at {}", dir.display())
+            } else {
+                format!(
+                    "config already in place at {}; {}",
+                    dir.display(),
+                    out.message
+                )
+            },
             restart_required: false,
         },
         Ok(out) => UpsConfigOutcome {
@@ -119,8 +127,9 @@ pub fn config_set_typed(cfg: UpsConfig) -> UpsConfigOutcome {
             provider: crate::PROVIDER.to_string(),
             ok: false,
             message: format!(
-                "failed to apply in {} ({e}); needs privilege",
-                dir.display()
+                "failed to apply in {} ({e}){}",
+                dir.display(),
+                crate::config::privilege_hint(&e)
             ),
             restart_required: false,
         },

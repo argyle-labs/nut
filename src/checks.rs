@@ -21,8 +21,8 @@ use plugin_toolkit::contract::diagnostics::{
 
 use crate::client::{NutClient, Ups, DEFAULT_PORT};
 use crate::config::{
-    detect_conf_dir, detect_init, marker_value, strip_comment, tokenize, InitSystem,
-    NotifySettings, NutConfig, UpsmonSettings,
+    detect_conf_dir, detect_init, marker_value, privilege_hint, read_or_empty, strip_comment,
+    tokenize, InitSystem, NotifySettings, NutConfig, UpsmonSettings,
 };
 
 /// A `SHUTDOWNCMD` that can wedge on a stuck array unmount because it carries no
@@ -51,8 +51,20 @@ pub async fn diagnose_typed(_args: DiagnoseArgs) -> Vec<Finding> {
         ));
         None
     });
-    let upssched = fs::read_to_string(dir.join("upssched.conf")).unwrap_or_default();
-    let ups_conf = fs::read_to_string(dir.join("ups.conf")).unwrap_or_default();
+    let mut read = |id: &str, name: &str| {
+        read_or_empty(&dir.join(name)).unwrap_or_else(|e| {
+            findings.push(finding(
+                id,
+                Severity::Crit,
+                &format!("{name} cannot be read"),
+                format!("{e}; fix it by hand before orca can check or repair it"),
+                None,
+            ));
+            String::new()
+        })
+    };
+    let upssched = read("upssched-conf", "upssched.conf");
+    let ups_conf = read("ups-conf", "ups.conf");
     // A `ups-comms` finding is only meaningful when this host is a NUT server
     // (has ups.conf sections) or runs apcupsd (migration candidate).
     let needs_comms = !ups_conf.trim().is_empty() || apcupsd_present();
@@ -79,6 +91,7 @@ pub async fn diagnose_typed(_args: DiagnoseArgs) -> Vec<Finding> {
         &upsmon,
         &upssched,
         detect_init(Path::new("/")) == InitSystem::Unraid,
+        on_tmpfs,
     ));
     findings.extend(check_onbattery_capture(&upssched));
     findings
@@ -331,6 +344,7 @@ fn check_persistent_event_log(
     upsmon: &Option<UpsmonSettings>,
     upssched: &str,
     unraid: bool,
+    tmpfs: fn(&Path) -> bool,
 ) -> Option<Finding> {
     // Only assess once NUT (upsmon) is set up.
     upsmon.as_ref()?;
@@ -340,10 +354,7 @@ fn check_persistent_event_log(
             if unraid {
                 p.starts_with("/boot")
             } else {
-                p.is_absolute()
-                    && !["/tmp", "/run", "/dev/shm"]
-                        .iter()
-                        .any(|t| p.starts_with(t))
+                p.is_absolute() && !tmpfs(p)
             }
         })
         .unwrap_or(false);
@@ -487,9 +498,17 @@ fn write_config(dir: &Path, what: &str, cfg: NutConfig) -> (bool, String) {
         );
     }
     match cfg.apply(dir) {
-        Ok(out) if out.written.is_empty() => (
+        Ok(out) if out.written.is_empty() && out.message.is_empty() => (
             true,
             format!("{what} already in place at {}", dir.display()),
+        ),
+        Ok(out) if out.written.is_empty() => (
+            true,
+            format!(
+                "{what} already in place at {}; {}",
+                dir.display(),
+                out.message
+            ),
         ),
         Ok(out) => (
             true,
@@ -503,8 +522,9 @@ fn write_config(dir: &Path, what: &str, cfg: NutConfig) -> (bool, String) {
         Err(e) => (
             false,
             format!(
-                "failed to apply {what} in {} ({e}); needs privilege",
-                dir.display()
+                "failed to apply {what} in {} ({e}){}",
+                dir.display(),
+                privilege_hint(&e)
             ),
         ),
     }
@@ -566,11 +586,19 @@ fn repair_apcupsd_migrate() -> (bool, String) {
 /// topology is already present, so the config-writing repairs don't discard an
 /// operator's UPS/monitor setup while still enforcing the safe values.
 fn merged_safe_config(dir: &Path) -> Result<NutConfig, String> {
-    merged_safe_config_for(dir, detect_init(Path::new("/")) == InitSystem::Unraid)
+    merged_safe_config_for(
+        dir,
+        detect_init(Path::new("/")) == InitSystem::Unraid,
+        on_tmpfs,
+    )
 }
 
-/// [`merged_safe_config`] with the host's Unraid-ness given.
-fn merged_safe_config_for(dir: &Path, unraid: bool) -> Result<NutConfig, String> {
+/// [`merged_safe_config`] with the host's Unraid-ness and tmpfs probe given.
+fn merged_safe_config_for(
+    dir: &Path,
+    unraid: bool,
+    tmpfs: fn(&Path) -> bool,
+) -> Result<NutConfig, String> {
     let mut cfg = NutConfig::read_existing(dir)?;
     // Intentional: the safe-config repairs always enforce kill-power; turning it
     // off is a deliberate ups config_set, not a repair.
@@ -583,11 +611,57 @@ fn merged_safe_config_for(dir: &Path, unraid: bool) -> Result<NutConfig, String>
     if shutdown_cmd_unsafe(&cfg.upsmon.shutdown_cmd) {
         cfg.upsmon.shutdown_cmd = UpsmonSettings::default().shutdown_cmd;
     }
-    // On Unraid only /boot survives the power-cycle; elsewhere keep the operator's path.
-    if unraid && !Path::new(&cfg.notify.log_path).starts_with("/boot") {
-        cfg.notify.log_path = NotifySettings::default().log_path;
+    // On Unraid only /boot survives the power-cycle; elsewhere any path off tmpfs does.
+    let log = Path::new(&cfg.notify.log_path);
+    let lost = if unraid {
+        !log.starts_with("/boot")
+    } else {
+        !log.is_absolute() || tmpfs(log)
+    };
+    if lost {
+        cfg.notify.log_path = NotifySettings::for_host(unraid).log_path;
     }
     Ok(cfg)
+}
+
+const TMPFS_PREFIXES: [&str; 3] = ["/tmp", "/run", "/dev/shm"];
+
+/// Whether `path` lives on tmpfs, judged by statfs on its nearest existing
+/// ancestor; the well-known tmpfs prefixes when statfs cannot answer.
+fn on_tmpfs(path: &Path) -> bool {
+    tmpfs_by(path, statfs_tmpfs)
+}
+
+fn tmpfs_by(path: &Path, probe: impl Fn(&Path) -> Option<bool>) -> bool {
+    path.ancestors()
+        .find(|p| p.exists())
+        .and_then(probe)
+        .unwrap_or_else(|| prefix_tmpfs(path))
+}
+
+fn prefix_tmpfs(path: &Path) -> bool {
+    TMPFS_PREFIXES.iter().any(|t| path.starts_with(t))
+}
+
+#[cfg(target_os = "linux")]
+fn statfs_tmpfs(path: &Path) -> Option<bool> {
+    use std::os::unix::ffi::OsStrExt;
+    const TMPFS_MAGIC: i64 = 0x0102_1994;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `c` is a valid NUL-terminated path and `st` a writable statfs.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    // `f_type`'s integer type differs between glibc and musl.
+    #[allow(clippy::unnecessary_cast)]
+    let f_type = st.f_type as i64;
+    Some(f_type == TMPFS_MAGIC)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn statfs_tmpfs(_path: &Path) -> Option<bool> {
+    None
 }
 
 /// Parse `upsmon.conf` into the fields the checks read. `Ok(None)` when the
@@ -797,7 +871,7 @@ DEADTIME 15
     #[test]
     fn persistent_event_log_warns_when_missing() {
         let s = read_upsmon(write_upsmon(UPSMON_SAFE).path()).unwrap();
-        let f = check_persistent_event_log(&s, "", true).expect("finding");
+        let f = check_persistent_event_log(&s, "", true, prefix_tmpfs).expect("finding");
         assert_eq!(f.severity, Severity::Warn);
         assert_eq!(f.id, "persistent-event-log");
     }
@@ -805,7 +879,10 @@ DEADTIME 15
     #[test]
     fn persistent_event_log_ok_for_managed_upssched() {
         // A managed upssched.conf carries the flash + remote markers.
-        let upssched = NutConfig::default();
+        let upssched = NutConfig {
+            notify: NotifySettings::for_host(true),
+            ..Default::default()
+        };
         let rendered = upssched
             .render()
             .into_iter()
@@ -813,7 +890,7 @@ DEADTIME 15
             .unwrap()
             .contents;
         let s = read_upsmon(write_upsmon(UPSMON_SAFE).path()).unwrap();
-        let f = check_persistent_event_log(&s, &rendered, true).expect("finding");
+        let f = check_persistent_event_log(&s, &rendered, true, prefix_tmpfs).expect("finding");
         assert_eq!(f.severity, Severity::Ok);
     }
 
@@ -938,10 +1015,13 @@ DEADTIME 15
         let sched = "# Managed by orca (nut plugin). Do not edit by hand.\n\
                      # orca-log-path /var/log/nut/events.log\n";
         fs::write(dir.path().join("upssched.conf"), sched).unwrap();
-        let keep = merged_safe_config_for(dir.path(), false).unwrap();
+        let keep = merged_safe_config_for(dir.path(), false, prefix_tmpfs).unwrap();
         assert_eq!(keep.notify.log_path, "/var/log/nut/events.log");
-        let unraid = merged_safe_config_for(dir.path(), true).unwrap();
-        assert_eq!(unraid.notify.log_path, NotifySettings::default().log_path);
+        let unraid = merged_safe_config_for(dir.path(), true, prefix_tmpfs).unwrap();
+        assert_eq!(
+            unraid.notify.log_path,
+            NotifySettings::for_host(true).log_path
+        );
     }
 
     #[test]
@@ -953,7 +1033,7 @@ DEADTIME 15
             ("/bootleg/events.log", false),
         ] {
             let sched = format!("# orca-log-path {path}\n# orca-remote-syslog 10.0.0.9:514\n");
-            let f = check_persistent_event_log(&s, &sched, true).expect("finding");
+            let f = check_persistent_event_log(&s, &sched, true, prefix_tmpfs).expect("finding");
             assert_eq!(f.severity == Severity::Ok, ok, "{path}");
         }
     }
@@ -969,7 +1049,7 @@ DEADTIME 15
             ("/dev/shm/events.log", false),
         ] {
             let sched = format!("# orca-log-path {path}\n# orca-remote-syslog 10.0.0.9:514\n");
-            let f = check_persistent_event_log(&s, &sched, false).expect("finding");
+            let f = check_persistent_event_log(&s, &sched, false, prefix_tmpfs).expect("finding");
             assert_eq!(f.severity == Severity::Ok, ok, "{path}");
         }
     }
@@ -979,5 +1059,53 @@ DEADTIME 15
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join("upsmon.conf")).unwrap();
         assert!(read_upsmon(dir.path()).is_err());
+    }
+
+    #[test]
+    fn tmpfs_probe_walks_to_existing_ancestor_and_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("a/b/events.log");
+        let seen = std::cell::RefCell::new(None);
+        assert!(tmpfs_by(&missing, |p| {
+            *seen.borrow_mut() = Some(p.to_path_buf());
+            Some(true)
+        }));
+        assert_eq!(seen.into_inner().as_deref(), Some(dir.path()));
+        assert!(!tmpfs_by(Path::new("/tmp/x"), |_| Some(false)));
+        assert!(tmpfs_by(Path::new("/tmp/x"), |_| None));
+        assert!(!tmpfs_by(Path::new("/var/log/x"), |_| None));
+    }
+
+    #[test]
+    fn non_unraid_repair_resets_tmpfs_log_path() {
+        let dir = write_upsmon(UPSMON_SAFE);
+        let sched = "# Managed by orca (nut plugin). Do not edit by hand.\n\
+                     # orca-log-path /run/nut/events.log\n";
+        fs::write(dir.path().join("upssched.conf"), sched).unwrap();
+        let cfg = merged_safe_config_for(dir.path(), false, prefix_tmpfs).unwrap();
+        assert_eq!(cfg.notify.log_path, "/var/log/nut/events.log");
+        let cfg = merged_safe_config_for(dir.path(), false, |_| true).unwrap();
+        assert_eq!(cfg.notify.log_path, "/var/log/nut/events.log");
+    }
+
+    #[test]
+    fn non_unraid_defaults_use_var_log() {
+        let n = NotifySettings::for_host(false);
+        assert_eq!(n.log_path, "/var/log/nut/events.log");
+        assert!(n
+            .onbattery_capture_cmd
+            .ends_with(">> /var/log/nut/onbattery.json"));
+        assert!(NotifySettings::for_host(true)
+            .log_path
+            .starts_with("/boot/"));
+    }
+
+    #[test]
+    fn statfs_detects_tmpfs_where_available() {
+        if Path::new("/dev/shm").is_dir() {
+            if let Some(t) = statfs_tmpfs(Path::new("/dev/shm")) {
+                assert!(t);
+            }
+        }
     }
 }
