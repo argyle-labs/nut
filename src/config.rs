@@ -842,7 +842,7 @@ fn unraid_gui_mode(root: &Path) -> Option<String> {
         let manual = text
             .lines()
             .filter_map(|l| {
-                let (k, v) = l.split_once('=')?;
+                let (k, v) = strip_comment(l).split_once('=')?;
                 (k.trim() == "MANUAL").then(|| v.trim().trim_matches('"').to_string())
             })
             .next_back();
@@ -2089,6 +2089,34 @@ NOTIFYFLAG REPLBATT SYSLOG+WALL\n";
     }
 
     #[test]
+    fn unraid_manual_ignores_trailing_comment() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = root.path().join("boot/config/plugins/nut/nut.cfg");
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        std::fs::write(&cfg, "MANUAL=\"enable\" # set by orca\n").unwrap();
+        assert!(unraid_gui_mode(root.path()).is_none());
+        std::fs::write(&cfg, "MANUAL=disable # gui\n").unwrap();
+        assert_eq!(
+            unraid_gui_mode(root.path()).as_deref(),
+            Some("MANUAL=disable in /boot/config/plugins/nut/nut.cfg")
+        );
+    }
+
+    #[test]
+    fn trailing_comments_spare_quoted_hash() {
+        assert_eq!(strip_comment("KEY value # c"), "KEY value ");
+        assert_eq!(strip_comment(r#"KEY "a#b" # c"#), r#"KEY "a#b" "#);
+        assert_eq!(strip_comment(r"KEY a\#b # c"), r"KEY a\#b ");
+        assert_eq!(tokenize(r#"KEY "a # b" # c"#), ["KEY", "a # b"]);
+        assert_eq!(tokenize("KEY value# c"), ["KEY", "value"]);
+        let ups = parse_ups_conf("[u]\n driver = x # c\n port = \"/dev/a#1\" # c\n").unwrap();
+        assert_eq!(
+            (ups[0].driver.as_str(), ups[0].port.as_str()),
+            ("x", "/dev/a#1")
+        );
+    }
+
+    #[test]
     fn monitor_in_both_lists_is_refused() {
         let (dir, group) = setup();
         write_full(dir.path());
@@ -2194,7 +2222,9 @@ NOTIFYFLAG REPLBATT SYSLOG+WALL\n";
     fn managed_upssched_has_no_dead_routing() {
         let sched = sample().render_upssched_conf();
         assert!(
-            !sched.lines().any(|l| l.starts_with("CMDSCRIPT") || l.starts_with("AT ")),
+            !sched
+                .lines()
+                .any(|l| l.starts_with("CMDSCRIPT") || l.starts_with("AT ")),
             "{sched}"
         );
         assert!(sample().render_upsmon_conf().contains("NOTIFYCMD "));
