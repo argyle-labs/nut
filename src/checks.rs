@@ -75,7 +75,11 @@ pub async fn diagnose_typed(_args: DiagnoseArgs) -> Vec<Finding> {
     findings.extend(check_battery_thresholds(&upsmon, live_runtime));
     findings.extend(check_kill_power(&upsmon));
     findings.extend(check_shutdown_command(&upsmon));
-    findings.extend(check_persistent_event_log(&upsmon, &upssched));
+    findings.extend(check_persistent_event_log(
+        &upsmon,
+        &upssched,
+        detect_init(Path::new("/")) == InitSystem::Unraid,
+    ));
     findings.extend(check_onbattery_capture(&upssched));
     findings
 }
@@ -322,11 +326,26 @@ fn check_shutdown_command(upsmon: &Option<UpsmonSettings>) -> Option<Finding> {
 
 /// `persistent-event-log`: NUT event notifications log to tmpfs only / no
 /// remote → the power-cycle recovery needs erases the evidence.
-fn check_persistent_event_log(upsmon: &Option<UpsmonSettings>, upssched: &str) -> Option<Finding> {
+/// On Unraid only /boot (flash) survives a reboot; elsewhere any path off tmpfs does.
+fn check_persistent_event_log(
+    upsmon: &Option<UpsmonSettings>,
+    upssched: &str,
+    unraid: bool,
+) -> Option<Finding> {
     // Only assess once NUT (upsmon) is set up.
     upsmon.as_ref()?;
     let has_flash = marker_value(upssched, "orca-log-path")
-        .map(|v| Path::new(&v).starts_with("/boot"))
+        .map(|v| {
+            let p = Path::new(&v);
+            if unraid {
+                p.starts_with("/boot")
+            } else {
+                p.is_absolute()
+                    && !["/tmp", "/run", "/dev/shm"]
+                        .iter()
+                        .any(|t| p.starts_with(t))
+            }
+        })
         .unwrap_or(false);
     let has_remote = marker_value(upssched, "orca-remote-syslog")
         .map(|v| !v.is_empty())
@@ -336,7 +355,7 @@ fn check_persistent_event_log(upsmon: &Option<UpsmonSettings>, upssched: &str) -
             "persistent-event-log",
             Severity::Ok,
             "NUT events log to persistent flash and a remote target",
-            "upssched writes event records to /boot and forwards to remote syslog — \
+            "upssched writes event records to persistent storage and forwards to remote syslog — \
              they survive a power-cycle."
                 .to_string(),
             None,
@@ -352,7 +371,7 @@ fn check_persistent_event_log(upsmon: &Option<UpsmonSettings>, upssched: &str) -
             .to_string(),
         Some(repair_spec(
             "persistent-event-log",
-            "Install upssched NOTIFY logging to flash (/boot) and a remote syslog target (privileged)",
+            "Install upssched NOTIFY logging to persistent storage (/boot on Unraid) and a remote syslog target (privileged)",
         )),
     ))
 }
@@ -778,7 +797,7 @@ DEADTIME 15
     #[test]
     fn persistent_event_log_warns_when_missing() {
         let s = read_upsmon(write_upsmon(UPSMON_SAFE).path()).unwrap();
-        let f = check_persistent_event_log(&s, "").expect("finding");
+        let f = check_persistent_event_log(&s, "", true).expect("finding");
         assert_eq!(f.severity, Severity::Warn);
         assert_eq!(f.id, "persistent-event-log");
     }
@@ -794,7 +813,7 @@ DEADTIME 15
             .unwrap()
             .contents;
         let s = read_upsmon(write_upsmon(UPSMON_SAFE).path()).unwrap();
-        let f = check_persistent_event_log(&s, &rendered).expect("finding");
+        let f = check_persistent_event_log(&s, &rendered, true).expect("finding");
         assert_eq!(f.severity, Severity::Ok);
     }
 
@@ -926,7 +945,7 @@ DEADTIME 15
     }
 
     #[test]
-    fn flash_path_must_be_under_boot() {
+    fn unraid_log_path_must_be_under_boot() {
         let s = read_upsmon(write_upsmon(UPSMON_SAFE).path()).unwrap();
         for (path, ok) in [
             ("/boot/config/plugins/nut/events.log", true),
@@ -934,7 +953,23 @@ DEADTIME 15
             ("/bootleg/events.log", false),
         ] {
             let sched = format!("# orca-log-path {path}\n# orca-remote-syslog 10.0.0.9:514\n");
-            let f = check_persistent_event_log(&s, &sched).expect("finding");
+            let f = check_persistent_event_log(&s, &sched, true).expect("finding");
+            assert_eq!(f.severity == Severity::Ok, ok, "{path}");
+        }
+    }
+
+    #[test]
+    fn non_unraid_log_path_must_be_off_tmpfs() {
+        let s = read_upsmon(write_upsmon(UPSMON_SAFE).path()).unwrap();
+        for (path, ok) in [
+            ("/var/log/nut/events.log", true),
+            ("/boot/config/plugins/nut/events.log", true),
+            ("/tmp/events.log", false),
+            ("/run/nut/events.log", false),
+            ("/dev/shm/events.log", false),
+        ] {
+            let sched = format!("# orca-log-path {path}\n# orca-remote-syslog 10.0.0.9:514\n");
+            let f = check_persistent_event_log(&s, &sched, false).expect("finding");
             assert_eq!(f.severity == Severity::Ok, ok, "{path}");
         }
     }

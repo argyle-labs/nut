@@ -1,3 +1,6 @@
+//! NUT has no config API: its conf files are the official configuration interface, so file
+//! edits here are the documented exception to the official-API rule.
+//!
 //! NUT config model + idempotent renderers for the four `upsd`/`upsmon` files.
 //!
 //! `configure` receives a JSON [`NutConfig`] and writes `ups.conf`,
