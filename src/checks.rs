@@ -604,6 +604,9 @@ fn repair_upssched_config(
         .flatten();
     let (ok, msg) = write_config(dir, what, cfg);
     match replaced {
+        Some(old) if ok && old.trim().is_empty() => {
+            (ok, format!("{msg}; sets NOTIFYCMD to the orca handler"))
+        }
         Some(old) if ok => (
             ok,
             format!("{msg}; replaces NOTIFYCMD {old} with the orca handler"),
@@ -1188,7 +1191,8 @@ DEADTIME 15
         )
         .unwrap();
         for what in ["persistent + remote event logging", "on-battery capture"] {
-            let (ok, msg) = repair_upssched_config(dir.path(), false, what, true);
+            let (ok, msg) =
+                repair_upssched_config(dir.path(), false, what, what == "on-battery capture");
             assert!(!ok);
             assert!(msg.contains("replace_custom_upssched: true"), "{msg}");
         }
