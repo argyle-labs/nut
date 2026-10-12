@@ -42,6 +42,10 @@ pub struct NutConfig {
     /// any on-disk UPS not listed here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remove_upses: Vec<String>,
+    /// On-disk `MONITOR` systems (`ups@host`) the caller intends to drop. Apply
+    /// refuses to shrink the MONITOR count by more than these.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remove_monitors: Vec<String>,
     /// Unmodelled `ups.conf` global lines (before the first section), kept verbatim.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ups_globals: Vec<String>,
@@ -54,6 +58,9 @@ pub struct NutConfig {
     /// An operator-written `upssched.conf`, kept verbatim instead of the managed one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upssched_custom: Option<String>,
+    /// Render the managed `upssched.conf` even when `upssched_custom` is set.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replace_custom_upssched: bool,
 }
 
 /// One UPS section in `ups.conf` (`[name]` + `driver`/`port`/…).
@@ -277,14 +284,29 @@ impl NutConfig {
             ));
         }
         let upsmon_text = std::fs::read_to_string(dir.join("upsmon.conf")).unwrap_or_default();
-        let raw_monitors = upsmon_text
+        let disk_monitors: Vec<String> = upsmon_text
             .lines()
-            .filter(|l| tokenize(l).first().is_some_and(|t| t == "MONITOR"))
-            .count();
-        if raw_monitors > self.monitors.len() {
+            .map(tokenize)
+            .filter(|t| t.first().is_some_and(|t| t == "MONITOR"))
+            .map(|t| t.get(1).cloned().unwrap_or_default())
+            .collect();
+        let raw_monitors = disk_monitors.len();
+        let unknown_monitors: Vec<&str> = self
+            .remove_monitors
+            .iter()
+            .map(String::as_str)
+            .filter(|r| !disk_monitors.iter().any(|m| m == r))
+            .collect();
+        if !unknown_monitors.is_empty() {
+            return Err(format!(
+                "refusing to apply: remove_monitors lists {} which is not in upsmon.conf",
+                unknown_monitors.join(", ")
+            ));
+        }
+        if raw_monitors > self.monitors.len() + self.remove_monitors.len() {
             return Err(format!(
                 "refusing to apply: upsmon.conf has {raw_monitors} MONITOR lines but the \
-                 config carries only {}",
+                 config carries only {}; list dropped ones in remove_monitors",
                 self.monitors.len()
             ));
         }
@@ -481,7 +503,11 @@ impl NutConfig {
     }
 
     fn render_upssched_conf(&self) -> String {
-        if let Some(custom) = &self.upssched_custom {
+        if let Some(custom) = self
+            .upssched_custom
+            .as_ref()
+            .filter(|_| !self.replace_custom_upssched)
+        {
             return custom.clone();
         }
         let n = &self.notify;
@@ -1590,6 +1616,60 @@ NOTIFYFLAG REPLBATT SYSLOG+WALL\n";
             .apply_with(dir.path(), &MockServices::default(), &group)
             .unwrap_err();
         assert!(err.contains("[section]"), "{err}");
+    }
+
+    #[test]
+    fn dropping_monitors_requires_remove_monitors() {
+        let (dir, group) = setup();
+        write_full(dir.path());
+        let mut cfg = NutConfig::read_existing(dir.path());
+        let dropped = cfg.monitors.pop().unwrap().system;
+        let err = cfg
+            .apply_with(dir.path(), &MockServices::default(), &group)
+            .unwrap_err();
+        assert!(err.contains("remove_monitors"), "{err}");
+
+        cfg.remove_monitors = vec!["ghost@localhost".into()];
+        let err = cfg
+            .apply_with(dir.path(), &MockServices::default(), &group)
+            .unwrap_err();
+        assert!(err.contains("ghost@localhost"), "{err}");
+
+        cfg.remove_monitors = vec![dropped.clone()];
+        cfg.apply_with(dir.path(), &MockServices::default(), &group)
+            .unwrap();
+        let mon = std::fs::read_to_string(dir.path().join("upsmon.conf")).unwrap();
+        assert!(!mon.contains(&dropped), "{mon}");
+    }
+
+    #[test]
+    fn remove_monitors_cannot_empty_the_config() {
+        let (dir, group) = setup();
+        write_full(dir.path());
+        let mut cfg = NutConfig::read_existing(dir.path());
+        cfg.remove_monitors = cfg.monitors.drain(..).map(|m| m.system).collect();
+        let err = cfg
+            .apply_with(dir.path(), &MockServices::default(), &group)
+            .unwrap_err();
+        assert!(err.contains("no MONITOR lines"), "{err}");
+    }
+
+    #[test]
+    fn replace_custom_upssched_renders_managed() {
+        let mut cfg = NutConfig {
+            upssched_custom: Some("CMDSCRIPT /custom\n".into()),
+            ..sample()
+        };
+        let find = |c: &NutConfig| {
+            c.render()
+                .into_iter()
+                .find(|f| f.name == "upssched.conf")
+                .unwrap()
+                .contents
+        };
+        assert_eq!(find(&cfg), "CMDSCRIPT /custom\n");
+        cfg.replace_custom_upssched = true;
+        assert!(find(&cfg).starts_with(MANAGED_HEADER));
     }
 
     #[test]

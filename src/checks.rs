@@ -391,8 +391,16 @@ pub fn repair_typed(args: RepairArgs) -> RepairOutcome {
         "battery-thresholds" => repair_write_config("safe battery thresholds"),
         "kill-power" => repair_kill_power(),
         "shutdown-command" => repair_write_config("completing, force-unmount-aware SHUTDOWNCMD"),
-        "persistent-event-log" => repair_write_config("persistent + remote event logging"),
-        "onbattery-capture" => repair_write_config("on-battery diagnostics capture hook"),
+        "persistent-event-log" => repair_upssched_config(
+            &detect_conf_dir(),
+            "persistent + remote event logging",
+            args.confirm,
+        ),
+        "onbattery-capture" => repair_upssched_config(
+            &detect_conf_dir(),
+            "on-battery diagnostics capture hook",
+            args.confirm,
+        ),
         "apcupsd-active" => repair_apcupsd_migrate(),
         other => (false, format!("nut has no in-place repair '{other}'")),
     };
@@ -412,7 +420,29 @@ fn repair_write_config(what: &str) -> (bool, String) {
     let dir = detect_conf_dir();
     // Merge the desired safe settings onto whatever is already configured so we
     // don't clobber an operator's UPS/monitor topology.
-    let cfg = merged_safe_config(&dir);
+    write_config(&dir, what, merged_safe_config(&dir))
+}
+
+/// A config repair whose fix lives in `upssched.conf`. A custom `upssched.conf`
+/// is kept verbatim, so the repair cannot succeed unless the caller opts in to
+/// replacing it (`replace_custom_upssched`, carried by the repair's `confirm`).
+fn repair_upssched_config(dir: &Path, what: &str, replace_custom_upssched: bool) -> (bool, String) {
+    let mut cfg = merged_safe_config(dir);
+    if cfg.upssched_custom.is_some() && !replace_custom_upssched {
+        return (
+            false,
+            format!(
+                "cannot apply {what}: a custom upssched.conf is in place in {} and was left \
+                 unchanged; rerun with confirm=true to replace it with the managed one",
+                dir.display()
+            ),
+        );
+    }
+    cfg.replace_custom_upssched = replace_custom_upssched;
+    write_config(dir, what, cfg)
+}
+
+fn write_config(dir: &Path, what: &str, cfg: NutConfig) -> (bool, String) {
     if cfg.monitors.is_empty() {
         return (
             false,
@@ -423,7 +453,7 @@ fn repair_write_config(what: &str) -> (bool, String) {
             ),
         );
     }
-    match cfg.apply(&dir) {
+    match cfg.apply(dir) {
         Ok(out) if out.written.is_empty() => (
             true,
             format!("{what} already in place at {}", dir.display()),
@@ -786,6 +816,27 @@ DEADTIME 15
         });
         assert!(!o.ok);
         assert!(o.message.contains("no in-place repair"));
+    }
+
+    #[test]
+    fn upssched_repairs_refuse_custom_upssched_without_opt_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let custom = "CMDSCRIPT /usr/bin/custom\n";
+        std::fs::write(dir.path().join("upssched.conf"), custom).unwrap();
+        std::fs::write(
+            dir.path().join("upsmon.conf"),
+            "MONITOR serverups@10.0.0.2 1 monuser secret slave\n",
+        )
+        .unwrap();
+        for what in ["persistent + remote event logging", "on-battery capture"] {
+            let (ok, msg) = repair_upssched_config(dir.path(), what, false);
+            assert!(!ok);
+            assert!(msg.contains("custom upssched.conf"), "{msg}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("upssched.conf")).unwrap(),
+            custom
+        );
     }
 
     #[tokio::test]
