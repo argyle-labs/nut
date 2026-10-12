@@ -57,13 +57,19 @@ pub async fn state_typed(args: UpsQueryArgs) -> Result<Vec<UpsState>, String> {
 /// SHUTDOWNCMD). Threshold fields are apcupsd-shaped and left `None` here; the
 /// unraid provider fills those for Unraid hosts.
 pub fn config_get_typed(args: UpsQueryArgs) -> Result<Vec<UpsConfig>, String> {
-    let dir = detect_conf_dir();
-    let upsmon = crate::checks::read_upsmon(&dir)?.unwrap_or_default();
+    config_get_in(&detect_conf_dir(), args)
+}
+
+/// [`config_get_typed`] against `dir`; settings are absent when no upsmon.conf exists.
+fn config_get_in(dir: &std::path::Path, args: UpsQueryArgs) -> Result<Vec<UpsConfig>, String> {
+    let upsmon = crate::checks::read_upsmon(dir)?;
     let id = args.id.unwrap_or_else(|| "default".to_string());
     Ok(vec![UpsConfig {
         id,
-        kill_power: Some(upsmon.kill_power),
-        shutdown_cmd: (!upsmon.shutdown_cmd.trim().is_empty()).then(|| upsmon.shutdown_cmd.clone()),
+        kill_power: upsmon.as_ref().map(|u| u.kill_power),
+        shutdown_cmd: upsmon
+            .map(|u| u.shutdown_cmd)
+            .filter(|c| !c.trim().is_empty()),
         ..Default::default()
     }])
 }
@@ -75,6 +81,7 @@ fn merged_config(dir: &std::path::Path, cfg: &UpsConfig) -> Result<NutConfig, St
         nut.upsmon.kill_power = k;
     }
     if let Some(s) = &cfg.shutdown_cmd {
+        crate::config::check_value("SHUTDOWNCMD", s)?;
         if !s.trim().is_empty() {
             nut.upsmon.shutdown_cmd = s.clone();
         }
@@ -125,10 +132,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn config_get_reports_kill_power_default() {
-        // No config dir → defaults; kill_power is always reported (Some).
-        let cfgs = config_get_typed(UpsQueryArgs::default()).unwrap();
-        assert!(cfgs.iter().any(|c| c.kill_power.is_some()));
+    fn config_get_absent_without_upsmon() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfgs = config_get_in(dir.path(), UpsQueryArgs::default()).unwrap();
+        assert_eq!(cfgs[0].kill_power, None);
+        assert_eq!(cfgs[0].shutdown_cmd, None);
+    }
+
+    #[test]
+    fn config_get_reports_on_disk_kill_power() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("upsmon.conf"), "SHUTDOWNCMD halt\n").unwrap();
+        let cfgs = config_get_in(dir.path(), UpsQueryArgs::default()).unwrap();
+        assert_eq!(cfgs[0].kill_power, Some(false));
+        assert_eq!(cfgs[0].shutdown_cmd.as_deref(), Some("halt"));
+    }
+
+    #[test]
+    fn config_get_propagates_read_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("upsmon.conf")).unwrap();
+        assert!(config_get_in(dir.path(), UpsQueryArgs::default()).is_err());
+    }
+
+    #[test]
+    fn config_set_refuses_newline_in_shutdown_cmd() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = merged_config(
+            dir.path(),
+            &UpsConfig {
+                shutdown_cmd: Some("/sbin/halt\nMONITOR x@y 1 u p master".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("control character"), "{err}");
     }
 
     #[test]

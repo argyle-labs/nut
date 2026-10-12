@@ -21,8 +21,8 @@ use plugin_toolkit::contract::diagnostics::{
 
 use crate::client::{NutClient, Ups, DEFAULT_PORT};
 use crate::config::{
-    detect_conf_dir, marker_value, strip_comment, tokenize, NotifySettings, NutConfig,
-    UpsmonSettings,
+    detect_conf_dir, detect_init, marker_value, strip_comment, tokenize, InitSystem,
+    NotifySettings, NutConfig, UpsmonSettings,
 };
 
 /// A `SHUTDOWNCMD` that can wedge on a stuck array unmount because it carries no
@@ -326,7 +326,7 @@ fn check_persistent_event_log(upsmon: &Option<UpsmonSettings>, upssched: &str) -
     // Only assess once NUT (upsmon) is set up.
     upsmon.as_ref()?;
     let has_flash = marker_value(upssched, "orca-log-path")
-        .map(|v| v.contains("/boot"))
+        .map(|v| Path::new(&v).starts_with("/boot"))
         .unwrap_or(false);
     let has_remote = marker_value(upssched, "orca-remote-syslog")
         .map(|v| !v.is_empty())
@@ -547,6 +547,11 @@ fn repair_apcupsd_migrate() -> (bool, String) {
 /// topology is already present, so the config-writing repairs don't discard an
 /// operator's UPS/monitor setup while still enforcing the safe values.
 fn merged_safe_config(dir: &Path) -> Result<NutConfig, String> {
+    merged_safe_config_for(dir, detect_init(Path::new("/")) == InitSystem::Unraid)
+}
+
+/// [`merged_safe_config`] with the host's Unraid-ness given.
+fn merged_safe_config_for(dir: &Path, unraid: bool) -> Result<NutConfig, String> {
     let mut cfg = NutConfig::read_existing(dir)?;
     // Intentional: the safe-config repairs always enforce kill-power; turning it
     // off is a deliberate ups config_set, not a repair.
@@ -559,8 +564,8 @@ fn merged_safe_config(dir: &Path) -> Result<NutConfig, String> {
     if shutdown_cmd_unsafe(&cfg.upsmon.shutdown_cmd) {
         cfg.upsmon.shutdown_cmd = UpsmonSettings::default().shutdown_cmd;
     }
-    // Event records must land on flash to survive the power-cycle.
-    if !cfg.notify.log_path.contains("/boot") {
+    // On Unraid only /boot survives the power-cycle; elsewhere keep the operator's path.
+    if unraid && !Path::new(&cfg.notify.log_path).starts_with("/boot") {
         cfg.notify.log_path = NotifySettings::default().log_path;
     }
     Ok(cfg)
@@ -570,8 +575,11 @@ fn merged_safe_config(dir: &Path) -> Result<NutConfig, String> {
 /// file is absent (NUT not set up as a monitor here); `Err` when a modelled
 /// setting is present but does not parse, so callers never act on a default.
 pub(crate) fn read_upsmon(dir: &Path) -> Result<Option<UpsmonSettings>, String> {
-    let Ok(text) = fs::read_to_string(dir.join("upsmon.conf")) else {
-        return Ok(None);
+    let path = dir.join("upsmon.conf");
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
     };
     let mut s = UpsmonSettings::default();
     let mut saw_flag = false;
@@ -903,5 +911,38 @@ DEADTIME 15
         for f in &findings {
             assert_eq!(f.provider, crate::PROVIDER);
         }
+    }
+
+    #[test]
+    fn flash_log_path_enforced_only_on_unraid() {
+        let dir = write_upsmon(UPSMON_SAFE);
+        let sched = "# Managed by orca (nut plugin). Do not edit by hand.\n\
+                     # orca-log-path /var/log/nut/events.log\n";
+        fs::write(dir.path().join("upssched.conf"), sched).unwrap();
+        let keep = merged_safe_config_for(dir.path(), false).unwrap();
+        assert_eq!(keep.notify.log_path, "/var/log/nut/events.log");
+        let unraid = merged_safe_config_for(dir.path(), true).unwrap();
+        assert_eq!(unraid.notify.log_path, NotifySettings::default().log_path);
+    }
+
+    #[test]
+    fn flash_path_must_be_under_boot() {
+        let s = read_upsmon(write_upsmon(UPSMON_SAFE).path()).unwrap();
+        for (path, ok) in [
+            ("/boot/config/plugins/nut/events.log", true),
+            ("/tmp/boot/events.log", false),
+            ("/bootleg/events.log", false),
+        ] {
+            let sched = format!("# orca-log-path {path}\n# orca-remote-syslog 10.0.0.9:514\n");
+            let f = check_persistent_event_log(&s, &sched).expect("finding");
+            assert_eq!(f.severity == Severity::Ok, ok, "{path}");
+        }
+    }
+
+    #[test]
+    fn unreadable_upsmon_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("upsmon.conf")).unwrap();
+        assert!(read_upsmon(dir.path()).is_err());
     }
 }

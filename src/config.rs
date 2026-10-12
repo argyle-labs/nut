@@ -212,16 +212,16 @@ impl NutConfig {
     /// `LISTEN`, `[section]`, `driver = …`) are dropped. A modelled value that
     /// does not parse is an error rather than a silent default.
     pub fn read_existing(dir: &Path) -> Result<Self, String> {
-        let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap_or_default();
-        let ups = read("ups.conf");
-        let upsd = read("upsd.conf");
-        let upsmon = read("upsmon.conf");
-        let upssched = read("upssched.conf");
+        let read = |name: &str| read_or_empty(&dir.join(name));
+        let ups = read("ups.conf")?;
+        let upsd = read("upsd.conf")?;
+        let upsmon = read("upsmon.conf")?;
+        let upssched = read("upssched.conf")?;
         let managed_sched = upssched.starts_with(MANAGED_HEADER);
         Ok(Self {
             upses: parse_ups_conf(&ups)?,
             listen: parse_upsd_conf(&upsd)?,
-            monitors: parse_monitors(&upsmon),
+            monitors: parse_monitors(&upsmon)?,
             upsmon: crate::checks::read_upsmon(dir)?.unwrap_or_default(),
             notify: parse_notify(&upsmon, managed_sched.then_some(upssched.as_str()))?,
             ups_globals: parse_ups_globals(&ups),
@@ -273,6 +273,8 @@ impl NutConfig {
         services: &dyn ServiceControl,
         group_file: &Path,
     ) -> Result<ApplyOutcome, String> {
+        self.check_values()
+            .map_err(|e| format!("refusing to apply: {e}"))?;
         if self.monitors.is_empty() {
             return Err(
                 "refusing to apply: config has no MONITOR lines, so upsmon would \
@@ -292,7 +294,7 @@ impl NutConfig {
                 incomplete.join(", ")
             ));
         }
-        let ups_text = std::fs::read_to_string(dir.join("ups.conf")).unwrap_or_default();
+        let ups_text = read_or_empty(&dir.join("ups.conf"))?;
         let on_disk = parse_ups_conf(&ups_text).map_err(|e| format!("refusing to apply: {e}"))?;
         let raw_sections = ups_text
             .lines()
@@ -305,7 +307,7 @@ impl NutConfig {
                 on_disk.len()
             ));
         }
-        let upsmon_text = std::fs::read_to_string(dir.join("upsmon.conf")).unwrap_or_default();
+        let upsmon_text = read_or_empty(&dir.join("upsmon.conf"))?;
         let disk_monitors: Vec<String> = upsmon_text
             .lines()
             .map(tokenize)
@@ -471,6 +473,73 @@ impl NutConfig {
         })
     }
 
+    /// Every value apply would render must be free of control characters (a
+    /// newline would inject a directive); managed events cannot be `IGNORE`d.
+    pub(crate) fn check_values(&self) -> Result<(), String> {
+        let mut values: Vec<(&str, &str)> = Vec::new();
+        for u in &self.upses {
+            values.extend([
+                ("ups name", u.name.as_str()),
+                ("ups driver", &u.driver),
+                ("ups port", &u.port),
+                ("ups description", &u.description),
+            ]);
+            for (k, v) in &u.extra {
+                values.extend([("ups option", k.as_str()), ("ups option", v)]);
+            }
+        }
+        values.extend(self.listen.iter().map(|l| ("LISTEN", l.address.as_str())));
+        for m in &self.monitors {
+            values.extend([
+                ("MONITOR", m.system.as_str()),
+                ("MONITOR", &m.username),
+                ("MONITOR", &m.password),
+                ("MONITOR", &m.role),
+            ]);
+        }
+        let (s, n) = (&self.upsmon, &self.notify);
+        values.extend([
+            ("SHUTDOWNCMD", s.shutdown_cmd.as_str()),
+            ("POWERDOWNFLAG", &s.power_down_flag),
+            ("NOTIFYCMD", &n.notify_cmd),
+            ("PIPEFN", &n.pipe),
+            ("LOCKFN", &n.lock),
+            ("log path", &n.log_path),
+            ("remote syslog", &n.remote_syslog),
+            ("onbattery capture", &n.onbattery_capture_cmd),
+        ]);
+        values.extend(
+            self.ups_globals
+                .iter()
+                .map(|l| ("ups.conf line", l.as_str())),
+        );
+        values.extend(
+            self.upsd_extra
+                .iter()
+                .map(|l| ("upsd.conf line", l.as_str())),
+        );
+        values.extend(
+            self.upsmon_extra
+                .iter()
+                .map(|l| ("upsmon.conf line", l.as_str())),
+        );
+        for (e, f) in &self.notify_flags {
+            values.extend([("NOTIFYFLAG", e.as_str()), ("NOTIFYFLAG", f)]);
+        }
+        for (what, v) in values {
+            check_value(what, v)?;
+        }
+        for (event, flags) in &self.notify_flags {
+            if MANAGED_EVENTS.contains(&event.as_str()) && flags.split('+').any(|f| f == "IGNORE") {
+                return Err(format!(
+                    "NOTIFYFLAG {event} IGNORE would silence an event orca relies on for logging \
+                     and shutdown; remove IGNORE"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn render_ups_conf(&self) -> String {
         let mut out = String::from(MANAGED_HEADER);
         for line in &self.ups_globals {
@@ -523,22 +592,28 @@ impl NutConfig {
             ));
         }
         out.push_str(&format!("MINSUPPLIES {}\n", s.min_supplies));
-        out.push_str(&format!("SHUTDOWNCMD \"{}\"\n", s.shutdown_cmd));
+        out.push_str(&format!("SHUTDOWNCMD {}\n", quote_token(&s.shutdown_cmd)));
         // read_upsmon derives kill_power from POWERDOWNFLAG's presence.
         if s.kill_power {
-            out.push_str(&format!("POWERDOWNFLAG {}\n", s.power_down_flag));
+            out.push_str(&format!(
+                "POWERDOWNFLAG {}\n",
+                quote_token(&s.power_down_flag)
+            ));
         }
         out.push_str(&format!("HOSTSYNC {}\n", s.host_sync));
         out.push_str(&format!("DEADTIME {}\n", s.dead_time));
         // Route every event through upssched so logging + capture run.
         out.push_str(&format!("NOTIFYCMD {}\n", quote_token(&n.notify_cmd)));
         for event in MANAGED_EVENTS {
-            let mut flags = MANAGED_FLAGS.join("+");
+            let mut flags = MANAGED_FLAGS.to_vec();
             for (_, extra) in self.notify_flags.iter().filter(|(e, _)| e == event) {
-                flags.push('+');
-                flags.push_str(extra);
+                for f in extra.split('+') {
+                    if !f.is_empty() && !flags.contains(&f) {
+                        flags.push(f);
+                    }
+                }
             }
-            out.push_str(&format!("NOTIFYFLAG {event} {flags}\n"));
+            out.push_str(&format!("NOTIFYFLAG {event} {}\n", flags.join("+")));
         }
         for line in &self.upsmon_extra {
             out.push_str(&format!("{line}\n"));
@@ -556,9 +631,9 @@ impl NutConfig {
         }
         let n = &self.notify;
         let mut out = String::from(MANAGED_HEADER);
-        out.push_str(&format!("CMDSCRIPT {}\n", n.notify_cmd));
-        out.push_str(&format!("PIPEFN {}\n", n.pipe));
-        out.push_str(&format!("LOCKFN {}\n", n.lock));
+        out.push_str(&format!("CMDSCRIPT {}\n", quote_token(&n.notify_cmd)));
+        out.push_str(&format!("PIPEFN {}\n", quote_token(&n.pipe)));
+        out.push_str(&format!("LOCKFN {}\n", quote_token(&n.lock)));
         // Persistent-event-log: every event logs to flash + remote immediately.
         for event in MANAGED_EVENTS {
             out.push_str(&format!(
@@ -570,11 +645,14 @@ impl NutConfig {
         out.push_str("AT ONBATT * EXECUTE onbattery-capture\n");
         // Persist the log target + remote + capture command as comments the
         // command handler reads (single source of truth for the handler).
-        out.push_str(&format!("# orca-log-path {}\n", n.log_path));
-        out.push_str(&format!("# orca-remote-syslog {}\n", n.remote_syslog));
+        out.push_str(&format!("# orca-log-path {}\n", quote_token(&n.log_path)));
+        out.push_str(&format!(
+            "# orca-remote-syslog {}\n",
+            quote_token(&n.remote_syslog)
+        ));
         out.push_str(&format!(
             "# orca-onbattery-capture {}\n",
-            n.onbattery_capture_cmd
+            quote_token(&n.onbattery_capture_cmd)
         ));
         out
     }
@@ -973,6 +1051,23 @@ pub(crate) fn tokenize(line: &str) -> Vec<String> {
     tokens
 }
 
+/// `Err` naming `what` when `v` holds a control character other than tab.
+pub(crate) fn check_value(what: &str, v: &str) -> Result<(), String> {
+    if v.contains(|c: char| c.is_control() && c != '\t') {
+        return Err(format!("{what} value {v:?} contains a control character"));
+    }
+    Ok(())
+}
+
+/// Contents of `path`; empty when it does not exist, any other read error propagates.
+pub(crate) fn read_or_empty(path: &Path) -> Result<String, String> {
+    match std::fs::read_to_string(path) {
+        Ok(t) => Ok(t),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(format!("read {}: {e}", path.display())),
+    }
+}
+
 /// `s` quoted and escaped if [`tokenize`] would otherwise split or mangle it.
 fn quote_token(s: &str) -> String {
     if !s.is_empty() && !s.contains(|c: char| c.is_whitespace() || matches!(c, '"' | '#' | '\\')) {
@@ -1076,22 +1171,28 @@ fn parse_upsd_extra(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn parse_monitors(text: &str) -> Vec<MonitorDef> {
-    text.lines()
-        .filter_map(|l| {
-            let f = tokenize(l);
-            if f.len() != 6 || f[0] != "MONITOR" {
-                return None;
-            }
-            Some(MonitorDef {
-                system: f[1].clone(),
-                power_value: f[2].parse().unwrap_or(1),
-                username: f[3].clone(),
-                password: f[4].clone(),
-                role: f[5].clone(),
-            })
-        })
-        .collect()
+fn parse_monitors(text: &str) -> Result<Vec<MonitorDef>, String> {
+    let mut monitors = Vec::new();
+    for l in text.lines() {
+        let f = tokenize(l);
+        if f.len() != 6 || f[0] != "MONITOR" {
+            continue;
+        }
+        let power_value = f[2].parse().map_err(|_| {
+            format!(
+                "upsmon.conf MONITOR {} has a non-numeric power value `{}`",
+                f[1], f[2]
+            )
+        })?;
+        monitors.push(MonitorDef {
+            system: f[1].clone(),
+            power_value,
+            username: f[3].clone(),
+            password: f[4].clone(),
+            role: f[5].clone(),
+        });
+    }
+    Ok(monitors)
 }
 
 /// `upsmon.conf` lines [`NutConfig::render_upsmon_conf`] does not itself emit.
@@ -1125,10 +1226,12 @@ fn parse_notify_flags(text: &str) -> Vec<(String, String)> {
             if kw != "NOTIFYFLAG" || !MANAGED_EVENTS.contains(&event.as_str()) {
                 return None;
             }
-            let extra: Vec<&str> = flags
-                .split('+')
-                .filter(|f| !f.is_empty() && !MANAGED_FLAGS.contains(f))
-                .collect();
+            let mut extra: Vec<&str> = Vec::new();
+            for f in flags.split('+') {
+                if !f.is_empty() && !MANAGED_FLAGS.contains(&f) && !extra.contains(&f) {
+                    extra.push(f);
+                }
+            }
             (!extra.is_empty()).then(|| (event.clone(), extra.join("+")))
         })
         .collect()
@@ -1176,7 +1279,10 @@ pub(crate) fn marker_value(upssched: &str, key: &str) -> Option<String> {
     upssched
         .lines()
         .find_map(|l| l.trim_start().strip_prefix(&prefix))
-        .map(|v| v.trim().to_string())
+        .map(|v| match tokenize(v).as_slice() {
+            [t] => t.clone(),
+            _ => v.trim().to_string(),
+        })
 }
 
 /// gid of the `nut` group from `group_file`, if present.
@@ -1887,21 +1993,35 @@ NOTIFYFLAG REPLBATT SYSLOG+WALL\n";
     }
 
     #[test]
-    fn operator_notifyflags_merge_with_managed() {
+    fn ignore_on_managed_event_is_refused() {
         let (dir, group) = setup();
         write_full(dir.path());
         let mon = dir.path().join("upsmon.conf");
         let text = std::fs::read_to_string(&mon).unwrap() + "NOTIFYFLAG ONBATT SYSLOG+IGNORE\n";
         std::fs::write(&mon, text).unwrap();
         let cfg = NutConfig::read_existing(dir.path()).unwrap();
-        cfg.apply_with(dir.path(), &MockServices::default(), &group)
-            .unwrap();
-        let out = std::fs::read_to_string(&mon).unwrap();
+        let err = cfg
+            .apply_with(dir.path(), &MockServices::default(), &group)
+            .unwrap_err();
+        assert!(err.contains("NOTIFYFLAG ONBATT IGNORE"), "{err}");
+    }
+
+    #[test]
+    fn operator_notifyflags_are_deduplicated() {
+        let mut cfg = sample();
+        cfg.notify_flags = vec![
+            ("ONBATT".into(), "X+WALL+X".into()),
+            ("ONBATT".into(), "X".into()),
+        ];
+        let mon = cfg.render_upsmon_conf();
         assert!(
-            out.contains("NOTIFYFLAG ONBATT SYSLOG+WALL+EXEC+IGNORE\n"),
-            "{out}"
+            mon.contains("NOTIFYFLAG ONBATT SYSLOG+WALL+EXEC+X\n"),
+            "{mon}"
         );
-        assert_eq!(NutConfig::read_existing(dir.path()).unwrap(), cfg);
+        assert_eq!(
+            parse_notify_flags("NOTIFYFLAG ONBATT SYSLOG+X+WALL+X\n"),
+            vec![("ONBATT".to_string(), "X".to_string())]
+        );
     }
 
     #[test]
@@ -1968,6 +2088,69 @@ NOTIFYFLAG REPLBATT SYSLOG+WALL\n";
         assert!(parse_upsd_conf("LISTEN 0.0.0.0 nut\n").is_err());
         let (dir, _) = setup();
         std::fs::write(dir.path().join("upsd.conf"), "LISTEN 0.0.0.0 nut\n").unwrap();
+        assert!(NutConfig::read_existing(dir.path()).is_err());
+    }
+
+    #[test]
+    fn quoted_values_round_trip_and_reapply_is_noop() {
+        let (dir, group) = setup();
+        let mut cfg = sample();
+        cfg.upsmon.shutdown_cmd = r#"sh -c "sync; /sbin/shutdown -h +0""#.into();
+        cfg.upsmon.power_down_flag = "/etc/kill power".into();
+        cfg.notify.pipe = "/var/run/nut/my pipe".into();
+        cfg.notify.log_path = "/boot/nut logs/events.log".into();
+        cfg.apply_with(dir.path(), &MockServices::default(), &group)
+            .unwrap();
+        let read = NutConfig::read_existing(dir.path()).unwrap();
+        assert_eq!(read.upsmon.shutdown_cmd, cfg.upsmon.shutdown_cmd);
+        assert_eq!(read.upsmon.power_down_flag, cfg.upsmon.power_down_flag);
+        assert_eq!(read.notify, cfg.notify);
+        let again = read
+            .apply_with(dir.path(), &MockServices::default(), &group)
+            .unwrap();
+        assert!(again.written.is_empty(), "{again:?}");
+    }
+
+    #[test]
+    fn newline_injection_is_refused() {
+        let (dir, group) = setup();
+        let mut cfg = sample();
+        cfg.upsmon.shutdown_cmd = "/sbin/halt\nMONITOR evil@host 1 u p master".into();
+        let err = cfg
+            .apply_with(dir.path(), &MockServices::default(), &group)
+            .unwrap_err();
+        assert!(err.contains("control character"), "{err}");
+        let mut cfg = sample();
+        cfg.notify.log_path = "/boot/x\r".into();
+        assert!(cfg.check_values().is_err());
+        assert!(entries(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn unreadable_files_fail_closed() {
+        let (dir, group) = setup();
+        std::fs::create_dir(dir.path().join("upsmon.conf")).unwrap();
+        assert!(NutConfig::read_existing(dir.path()).is_err());
+        assert!(sample()
+            .apply_with(dir.path(), &MockServices::default(), &group)
+            .is_err());
+        let (dir, group) = setup();
+        std::fs::create_dir(dir.path().join("ups.conf")).unwrap();
+        assert!(NutConfig::read_existing(dir.path()).is_err());
+        assert!(sample()
+            .apply_with(dir.path(), &MockServices::default(), &group)
+            .is_err());
+    }
+
+    #[test]
+    fn non_numeric_monitor_power_value_is_refused() {
+        assert!(parse_monitors("MONITOR u@localhost two user pass master\n").is_err());
+        let (dir, _) = setup();
+        std::fs::write(
+            dir.path().join("upsmon.conf"),
+            "MONITOR u@localhost x user pass master\n",
+        )
+        .unwrap();
         assert!(NutConfig::read_existing(dir.path()).is_err());
     }
 }
