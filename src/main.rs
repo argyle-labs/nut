@@ -7,11 +7,17 @@
 //! surface. The typed `Plugin` builder advertises every facet's backend def and
 //! routes each domain's ops through the contract's `dispatch_op`. The plugin is
 //! a `[[bin]]`, owns no runtime, and reaches orca only through the socket.
+//! Started through the `orca-nut-notify` symlink it runs the NUT event handler
+//! ([`nut::notify`]) instead and always exits 0.
 
 plugin_toolkit::instrument::bootstrap!();
 use plugin_toolkit::plugin::Plugin;
 
 fn main() -> plugin_toolkit::anyhow::Result<()> {
+    if nut::notify::invoked_as_handler(&std::env::args().next().unwrap_or_default()) {
+        nut::notify::run();
+        std::process::exit(0);
+    }
     Plugin::named(nut::PROVIDER)
         .version(env!("CARGO_PKG_VERSION"))
         .service(nut::NutBackend::new(nut::PROVIDER))

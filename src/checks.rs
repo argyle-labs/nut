@@ -24,6 +24,7 @@ use crate::config::{
     detect_conf_dir, detect_init, marker_value, privilege_hint, read_or_empty, strip_comment,
     tokenize, InitSystem, NotifySettings, NutConfig, UpsmonSettings,
 };
+use crate::notify;
 
 /// A `SHUTDOWNCMD` that can wedge on a stuck array unmount because it carries no
 /// force-unmount safety net — the exact failure mode this plan exists to fix.
@@ -94,6 +95,10 @@ pub async fn diagnose_typed(_args: DiagnoseArgs) -> Vec<Finding> {
         on_tmpfs,
     ));
     findings.extend(check_onbattery_capture(&upssched));
+    if upsmon.is_some() {
+        let upsmon_text = read_or_empty(&dir.join("upsmon.conf")).unwrap_or_default();
+        findings.extend(check_notify_handler(&upsmon_text, notify::is_executable));
+    }
     findings
 }
 
@@ -423,6 +428,66 @@ fn check_onbattery_capture(upssched: &str) -> Option<Finding> {
     }
 }
 
+/// `notify-handler`: the `NOTIFYCMD` upsmon runs must exist and be executable,
+/// or every event (and the on-battery capture) is silently lost.
+fn check_notify_handler(upsmon: &str, executable: fn(&Path) -> bool) -> Option<Finding> {
+    let cmd = notify_cmd(upsmon)?;
+    if executable(Path::new(&cmd)) {
+        return Some(finding(
+            "notify-handler",
+            Severity::Ok,
+            "NUT event handler is installed",
+            format!("NOTIFYCMD {cmd} exists and is executable."),
+            None,
+        ));
+    }
+    let ours = notify::invoked_as_handler(&cmd);
+    Some(finding(
+        "notify-handler",
+        Severity::Crit,
+        "NUT event handler is missing",
+        format!(
+            "NOTIFYCMD {cmd} does not exist or is not executable; upsmon cannot log events, \
+             forward them, or run the on-battery capture."
+        ),
+        ours.then(|| {
+            repair_spec(
+                "notify-handler",
+                "Install the orca-nut-notify handler (a link to the nut plugin binary) (privileged)",
+            )
+        }),
+    ))
+}
+
+fn notify_cmd(upsmon: &str) -> Option<String> {
+    upsmon.lines().find_map(|l| match tokenize(l).as_slice() {
+        [k, v] if k == "NOTIFYCMD" => Some(v.clone()),
+        _ => None,
+    })
+}
+
+fn repair_notify_handler(dir: &Path) -> (bool, String) {
+    let upsmon = match read_or_empty(&dir.join("upsmon.conf")) {
+        Ok(t) => t,
+        Err(e) => return (false, format!("cannot read upsmon.conf: {e}")),
+    };
+    let Some(cmd) = notify_cmd(&upsmon) else {
+        return (false, "upsmon.conf sets no NOTIFYCMD".to_string());
+    };
+    match notify::ensure_installed(&cmd) {
+        Ok(Some(true)) => (true, format!("installed {cmd}")),
+        Ok(Some(false)) => (true, format!("{cmd} already in place")),
+        Ok(None) => (
+            false,
+            format!("NOTIFYCMD {cmd} is not orca's handler; install it by hand"),
+        ),
+        Err(e) => (
+            false,
+            format!("failed to install {cmd} ({e}){}", privilege_hint(&e)),
+        ),
+    }
+}
+
 // ── repair ───────────────────────────────────────────────────────────────────
 
 /// Run one repair by id and return the typed [`RepairOutcome`]. Delegated
@@ -444,6 +509,7 @@ pub fn repair_typed(args: RepairArgs) -> RepairOutcome {
             "on-battery diagnostics capture hook",
         ),
         "apcupsd-active" => repair_apcupsd_migrate(),
+        "notify-handler" => repair_notify_handler(&detect_conf_dir()),
         other => (false, format!("nut has no in-place repair '{other}'")),
     };
     RepairOutcome {
@@ -773,6 +839,19 @@ pub(crate) fn run(bin: &str, args: &[&str]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notify_handler_check() {
+        let upsmon = "NOTIFYCMD /usr/local/bin/orca-nut-notify\n";
+        let f = check_notify_handler(upsmon, |_| true).unwrap();
+        assert_eq!(f.severity, Severity::Ok);
+        let f = check_notify_handler(upsmon, |_| false).unwrap();
+        assert_eq!(f.severity, Severity::Crit);
+        assert_eq!(f.repair.unwrap().id, "notify-handler");
+        let f = check_notify_handler("NOTIFYCMD /opt/mine.sh\n", |_| false).unwrap();
+        assert!(f.repair.is_none());
+        assert!(check_notify_handler("MINSUPPLIES 1\n", |_| false).is_none());
+    }
 
     const UPSMON_UNSAFE: &str = r#"
 # a monitor-only client with unsafe settings

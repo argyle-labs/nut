@@ -18,6 +18,7 @@ use plugin_toolkit::service::{
 pub mod checks;
 pub mod client;
 pub mod config;
+pub mod notify;
 pub mod registration;
 pub mod ups;
 
@@ -147,6 +148,7 @@ impl ServiceBackend for NutBackend {
             }
             let dir = detect_conf_dir();
             cfg.apply(&dir).map_err(ServiceError::Other)?;
+            notify::ensure_installed(&cfg.notify.notify_cmd).map_err(ServiceError::Other)?;
             Ok(())
         })
     }

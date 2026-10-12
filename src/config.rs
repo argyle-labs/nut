@@ -1374,7 +1374,7 @@ pub(crate) fn marker_value(upssched: &str, key: &str) -> Option<String> {
 }
 
 /// The trimmed text after an `# orca-<key> ` marker prefix.
-fn marker_raw<'a>(upssched: &'a str, key: &str) -> Option<&'a str> {
+pub(crate) fn marker_raw<'a>(upssched: &'a str, key: &str) -> Option<&'a str> {
     let prefix = format!("# {key} ");
     upssched
         .lines()
